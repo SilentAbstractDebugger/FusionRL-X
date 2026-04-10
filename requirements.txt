@@ -1,19 +1,15 @@
-
-
-        These are the requirements : yfinance==0.2.40
-        pandas==2.2.2
-        numpy==1.26.4
-        torch==2.3.1
-        gymnasium==0.29.1
-        stable-baselines3==2.3.2
-        scikit-learn==1.5.0
-        scipy==1.13.1
-        ta==0.11.0
-        hyperopt==0.2.7
-        matplotlib==3.9.0
-        seaborn==0.13.2
-        cvxpy==1.5.1
-        tqdm==4.66.4
-        quantstats==0.0.62
-        empyrical==0.5.5
-
+yfinance
+pandas
+numpy
+torch
+gymnasium
+stable-baselines3
+scikit-learn
+scipy
+ta
+hyperopt
+matplotlib
+seaborn
+cvxpy
+tqdm
+quantstats
