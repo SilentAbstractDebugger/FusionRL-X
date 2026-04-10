@@ -1,3 +1,4 @@
+
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -182,6 +183,11 @@ def train_all_agents(
             env=train_env,
             config=config,
         )
+
+        final_model = os.path.join(MODEL_DIR, f"ppo_{reward_type}.zip")
+        if os.path.exists(final_model):
+            print(f" Resuming training from {final_model}")
+            agent.load()
         agent.train()
         agents[reward_type] = agent
 
