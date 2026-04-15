@@ -1,0 +1,18 @@
+PRE-FUSION SANITY CHECK REPORT
+==================================================
+
+PPO-log_return: PASS
+  SR  = +0.4205
+  MDD = 17.8199%
+  CR  = +40.9552%
+
+PPO-dsr: PASS
+  SR  = +0.4867
+  MDD = 20.9451%
+  CR  = +43.9971%
+
+PPO-mdd: FAIL
+  SR  = +0.3339
+  MDD = 22.2097%
+  CR  = +34.6265%
+ CR = 34.63% underperforms 1/N (42.91%)
