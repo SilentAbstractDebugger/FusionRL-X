@@ -12,7 +12,7 @@ ZERO gradient signal to the dynamic gate (alpha_net) because:
   - Any fixed alpha value produces the same MSE if the transformer and
     agent blend are individually close to GT.
   - The gate has no incentive to vary — it sits at its initialisation.
-
+ 
 THE FIX — Three-component loss:
 ────────────────────────────────
   L = λ_mse  × MSE(pred, gt)                   ← original: match GT weights
