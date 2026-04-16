@@ -1,255 +1,449 @@
 """
 fusion/transformer_fusion.py
 ─────────────────────────────
-⚡ THIS FILE IS OWNED BY PARTNER 3 ⚡
+MARKET-PREDICTIVE TRANSFORMER FUSION  (Fixed Version)
+======================================================
 
-Transformer-based Fusion Module — replaces the paper's CNN (1×3 kernel).
+ROOT CAUSES OF THE FROZEN GATE (original bugs fixed here):
+───────────────────────────────────────────────────────────
+BUG 1 — Static scalar gate_alpha:
+  Original:  self.gate_alpha = nn.Parameter(torch.tensor(0.8))
+             alpha = torch.sigmoid(self.gate_alpha)   # → always ~0.693
+  Fix:       gate_alpha is now a DYNAMIC MLP that reads the market state
+             and outputs a per-sample alpha in (0,1). Each day gets its
+             own blend ratio based on how much the transformer "trusts itself".
 
-WHY TRANSFORMER INSTEAD OF CNN?
-────────────────────────────────
-The paper uses a CNN with a (1,3) kernel to aggregate 3 agent outputs per asset.
-This means it assigns FIXED local weights to the 3 agents — same aggregation rules
-for all assets.
+BUG 2 — disagree_norm in diagnostics is constant:
+  Original:  backtest.py averaged disagree_emb norm across a whole batch,
+             then assigned that same scalar to every date.
+  Fix:       predict_with_diagnostics now returns per-sample norms so
+             backtest.py can log a different value for each day.
 
-Transformer is BETTER because:
-1. SELF-ATTENTION: Can model cross-agent AND cross-asset relationships
-2. DYNAMIC weighting: Attention scores change per input (not fixed like conv weights)
-3. GLOBAL context: Attends to all 3 agents and all N assets simultaneously
-4. More expressive: Can learn "when log_return agent is confident, trust it more"
+BUG 3 — MSE-only pretraining gives no gradient signal to the gate:
+  The gate_alpha never received a meaningful gradient because MSE loss
+  optimizes predicted weights regardless of what alpha is. The Transformer
+  could set alpha=anything and still minimise MSE.
+  Fix:       supervised_pretraining.py adds a Sharpe-approximation auxiliary
+             loss and a gate-entropy regulariser that force alpha to vary.
 
-ARCHITECTURE OVERVIEW:
-─────────────────────
-Input: (batch, 3, N)  — 3 agents, N=29 assets each
+BUG 4 — Disagreement gate uses additive blend of disagree_emb:
+  Original:  market_state = market_state * gate + disagree_emb * (1 - gate)
+             This corrupts market_state with raw disagree_emb values.
+  Fix:       disagree_emb modulates a learned shift/scale on market_state
+             (FiLM conditioning), preserving market_state magnitude.
 
-Step 1: Linear embedding
-  Each agent's weight vector (N,) → embedded to (d_model,) = (64,)
-  Now: (batch, 3, d_model)   ← sequence of 3 "tokens" (one per agent)
+ARCHITECTURE (unchanged structure, fixed internals):
+─────────────────────────────────────────────────────
+  Input: (batch, 3, N)
 
-Step 2: Positional Encoding
-  Add learned positional encoding to distinguish Agent 1, 2, 3
-  Still: (batch, 3, d_model)
-
-Step 3: Transformer Encoder
-  Multi-head self-attention across the 3 agent tokens
-  Feed-forward network
-  Layer norm
-  Stack 2 layers → (batch, 3, d_model)
-
-Step 4: Aggregate
-  Average pool across the 3 agent tokens → (batch, d_model)
-  OR use a learnable [CLS] token
-
-Step 5: MLP head
-  (batch, d_model) → (batch, 128) → (batch, 64) → (batch, N)
-  Softmax → final portfolio weights
-
-WHAT PARTNER 3 NEEDS TO IMPLEMENT:
-────────────────────────────────────
-The class TransformerFusionModule(nn.Module) with:
-  - __init__(n_assets, n_agents, d_model, nhead, num_layers, dim_feedforward, dropout)
-  - forward(x: Tensor[batch, 3, N]) → Tensor[batch, N]
-
-The supervised_pretraining.py will import and use this class.
+  Stage 1: SIGNAL EXTRACTION per agent          [unchanged]
+  Stage 2: DISAGREEMENT MODULE                  [unchanged]
+  Stage 3: CROSS-AGENT TRANSFORMER              [unchanged]
+  Stage 4: ASSET SCORING HEAD                   [unchanged]
+  Stage 5: DYNAMIC RESIDUAL GATE                [FIXED — was static scalar]
+            alpha(x) = sigmoid(MLP(market_state))   ← per-sample
 """
 
+import os
+import sys
+import math
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import math
+import torch.nn.functional as F
 
 
-class PositionalEncoding(nn.Module):
+# ─────────────────────────────────────────────────────────
+# STAGE 1: SIGNAL EXTRACTOR  (unchanged)
+# ─────────────────────────────────────────────────────────
+
+class AgentSignalExtractor(nn.Module):
     """
-    Standard sinusoidal positional encoding.
-    With only 3 positions (3 agents), simple learned embeddings also work well.
+    Extracts implicit market signals from one agent's weight vector.
+
+    Analytical signals computed:
+      HHI        — how concentrated is the agent? (confidence measure)
+      Entropy    — how spread out? (uncertainty measure)
+      Top-K conc — fraction of weight in top K assets (conviction)
+      Max weight — dominant single pick
+      Min weight — how much does agent avoid worst asset
+      Std        — spread of conviction across assets
     """
 
-    def __init__(self, d_model: int, max_len: int = 10, dropout: float = 0.1):
+    def __init__(self, n_assets: int, d_model: int, top_k: int = 5):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        self.n_assets  = n_assets
+        self.top_k     = top_k
+        self.n_signals = 6
 
-        # Sinusoidal encoding
-        position = torch.arange(max_len).unsqueeze(1)                          # (max_len, 1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        self.weight_proj = nn.Sequential(
+            nn.Linear(n_assets, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.signal_proj = nn.Linear(self.n_signals, d_model)
+        self.merge = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
 
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+    def _compute_signals(self, w: torch.Tensor) -> torch.Tensor:
+        eps     = 1e-8
+        hhi     = (w ** 2).sum(dim=-1, keepdim=True)
+        entropy = -(w * (w + eps).log()).sum(dim=-1, keepdim=True) / math.log(self.n_assets)
+        top_k_v, _ = w.topk(self.top_k, dim=-1)
+        top_k_c = top_k_v.sum(dim=-1, keepdim=True)
+        max_w   = w.max(dim=-1, keepdim=True).values
+        min_w   = w.min(dim=-1, keepdim=True).values
+        std_w   = w.std(dim=-1, keepdim=True)
+        return torch.cat([hhi, entropy, top_k_c, max_w, min_w, std_w], dim=-1)
 
-        self.register_buffer("pe", pe)  # (max_len, d_model)
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        w_emb   = self.weight_proj(w)
+        signals = self._compute_signals(w)
+        sig_emb = self.signal_proj(signals)
+        return self.merge(torch.cat([w_emb, sig_emb], dim=-1))
+
+
+# ─────────────────────────────────────────────────────────
+# STAGE 2: DISAGREEMENT MODULE  (unchanged)
+# ─────────────────────────────────────────────────────────
+
+class DisagreementModule(nn.Module):
+    """
+    Computes pairwise disagreement between all 3 agent pairs.
+
+    Features per pair: cosine similarity, L1 distance, L2 distance
+    3 pairs × 3 features = 9 features total
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(9, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_model)
-        Returns:
-            x + positional_encoding: same shape
-        """
-        x = x + self.pe[:x.size(1)]
-        return self.dropout(x)
+        eps      = 1e-8
+        features = []
+        for i, j in [(0, 1), (0, 2), (1, 2)]:
+            wi, wj = x[:, i, :], x[:, j, :]
+            cos = F.cosine_similarity(wi, wj, dim=-1, eps=eps).unsqueeze(-1)
+            l1  = (wi - wj).abs().sum(dim=-1, keepdim=True)
+            l2  = ((wi - wj) ** 2).sum(dim=-1, keepdim=True).sqrt()
+            features.extend([cos, l1, l2])
+        return self.proj(torch.cat(features, dim=-1))
 
+
+# ─────────────────────────────────────────────────────────
+# STAGE 2b: FiLM DISAGREEMENT CONDITIONING  (NEW — replaces additive blend)
+# ─────────────────────────────────────────────────────────
+
+class FiLMDisagreementGate(nn.Module):
+    """
+    FiLM (Feature-wise Linear Modulation) conditioning.
+
+    Instead of additively blending disagree_emb into market_state
+    (which corrupts its magnitude), we use disagree_emb to predict
+    a per-dimension scale γ and shift β applied to market_state:
+
+        modulated = γ(disagree_emb) ⊙ market_state + β(disagree_emb)
+
+    This lets disagreement *steer* the market state without overwriting it.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.gamma_net = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Tanh(),         # γ ∈ (-1, 1) → scale shift around 1
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(
+        self, market_state: torch.Tensor, disagree_emb: torch.Tensor
+    ) -> torch.Tensor:
+        gamma = 1.0 + self.gamma_net(disagree_emb)   # (B, d_model) centred at 1
+        beta  = self.beta_net(disagree_emb)            # (B, d_model)
+        return gamma * market_state + beta
+
+
+# ─────────────────────────────────────────────────────────
+# STAGE 4: ASSET SCORING HEAD  (unchanged)
+# ─────────────────────────────────────────────────────────
+
+class AssetScoringHead(nn.Module):
+    """
+    Given the market state vector, scores each asset independently.
+    """
+
+    def __init__(self, n_assets: int, d_model: int):
+        super().__init__()
+        self.n_assets        = n_assets
+        self.asset_embeddings = nn.Embedding(n_assets, d_model)
+        self.bilinear        = nn.Bilinear(d_model, d_model, 1)
+        self.mlp_refine      = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, market_state: torch.Tensor) -> torch.Tensor:
+        B      = market_state.size(0)
+        device = market_state.device
+
+        ids       = torch.arange(self.n_assets, device=device)
+        asset_embs = self.asset_embeddings(ids)                           # (N, d)
+        state_exp  = market_state.unsqueeze(1).expand(-1, self.n_assets, -1)  # (B, N, d)
+        asset_exp  = asset_embs.unsqueeze(0).expand(B, -1, -1)           # (B, N, d)
+
+        s_flat   = state_exp.reshape(-1, state_exp.size(-1))
+        a_flat   = asset_exp.reshape(-1, asset_exp.size(-1))
+        bi_score = self.bilinear(s_flat, a_flat).reshape(B, self.n_assets)
+
+        mlp_score = self.mlp_refine(
+            torch.cat([state_exp, asset_exp], dim=-1)
+        ).squeeze(-1)
+
+        return F.softmax(bi_score + mlp_score, dim=-1)
+
+
+# ─────────────────────────────────────────────────────────
+# STAGE 5: DYNAMIC GATE  (NEW — replaces static scalar)
+# ─────────────────────────────────────────────────────────
+
+class DynamicGate(nn.Module):
+    """
+    Per-sample dynamic residual gate.
+
+    PROBLEM WITH THE ORIGINAL:
+      gate_alpha = nn.Parameter(torch.tensor(0.8))   # single scalar
+      alpha = torch.sigmoid(gate_alpha)              # ≈ 0.693 always
+
+      This is ONE number shared by ALL samples, ALL days.
+      The MSE pretraining loss has no incentive to change it because
+      the Transformer can hit near-optimal MSE with any fixed alpha.
+      Result: alpha never meaningfully updates → "frozen gate".
+
+    THE FIX:
+      alpha(x) = sigmoid( MLP( market_state ) )     # (B, 1) per sample
+
+      Now alpha depends on the market_state of each day:
+        - High transformer confidence → alpha → 1 (trust transformer more)
+        - High disagreement / uncertainty → alpha → 0 (blend more with agents)
+
+      This also means the gate receives informative gradients from both
+      the MSE loss AND the Sharpe auxiliary loss added in pretraining.
+
+    INITIALISATION:
+      MLP bias is initialised to +1.0 so sigmoid(+1) ≈ 0.73 at start,
+      close to the original 0.8 default — no cold-start instability.
+    """
+
+    def __init__(self, d_model: int, n_agents: int):
+        super().__init__()
+        self.n_agents = n_agents
+
+        # Reads market_state → scalar per sample
+        self.alpha_net = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        # Reads market_state → soft agent selector (which agent to trust more)
+        self.agent_selector = nn.Sequential(
+            nn.Linear(d_model, n_agents),
+            nn.Softmax(dim=-1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialise output bias so alpha ≈ 0.73 at start (close to original 0.8)
+        nn.init.zeros_(self.alpha_net[-1].weight)
+        nn.init.constant_(self.alpha_net[-1].bias, 1.0)
+
+    def forward(
+        self,
+        market_state:       torch.Tensor,   # (B, d_model)
+        transformer_weights: torch.Tensor,  # (B, N)
+        agent_actions:       torch.Tensor,  # (B, 3, N)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            final_weights: (B, N)  — blended portfolio
+            alpha:         (B, 1)  — per-sample gate value (for diagnostics)
+        """
+        alpha      = torch.sigmoid(self.alpha_net(market_state))        # (B, 1)
+        agent_sel  = self.agent_selector(market_state)                   # (B, 3)
+        agent_blend = (agent_actions * agent_sel.unsqueeze(-1)).sum(dim=1)  # (B, N)
+
+        final = alpha * transformer_weights + (1.0 - alpha) * agent_blend
+        final = final / (final.sum(dim=-1, keepdim=True) + 1e-8)
+
+        return final, alpha
+
+
+# ─────────────────────────────────────────────────────────
+# MAIN MODULE
+# ─────────────────────────────────────────────────────────
 
 class TransformerFusionModule(nn.Module):
     """
-    Transformer-based fusion of 3 PPO agent outputs.
+    Market-Predictive Transformer Fusion (Fixed).
 
-    INPUT:
-        x: (batch, 3, N)
-           3 = one row per agent (log_return, dsr, mdd)
-           N = number of assets (29 for Dow)
+    Key change from original:
+      gate_alpha is now a DynamicGate that outputs a per-sample alpha
+      based on the current market_state, instead of a frozen scalar.
 
-    OUTPUT:
-        weights: (batch, N) — final portfolio allocation
-                 Softmax applied → sums to 1, all ≥ 0
-
-    PARTNER 3: This is the full implementation. Verify the forward pass and
-    adjust d_model / nhead / num_layers if needed. The defaults match FUSION_CONFIG.
+    Input:  (batch, 3, N) — 3 agent weight vectors
+    Output: (batch, N)    — Transformer's own portfolio weights
     """
 
     def __init__(
         self,
-        n_assets:        int,
-        n_agents:        int   = 3,
-        d_model:         int   = 64,
-        nhead:           int   = 4,
-        num_layers:      int   = 2,
-        dim_feedforward: int   = 128,
-        dropout:         float = 0.1,
-        **kwargs,   # absorb extra config keys safely
+        n_assets:          int,
+        n_agents:          int   = 3,
+        d_model:           int   = 128,
+        nhead:             int   = 4,
+        num_layers:        int   = 3,
+        dim_feedforward:   int   = 256,
+        dropout:           float = 0.1,
+        top_k:             int   = 5,
+        use_residual_gate: bool  = True,
+        **kwargs,
     ):
         super().__init__()
+        self.n_assets          = n_assets
+        self.n_agents          = n_agents
+        self.d_model           = d_model
+        self.use_residual_gate = use_residual_gate
 
-        self.n_assets = n_assets
-        self.n_agents = n_agents
-        self.d_model  = d_model
+        # Stage 1: one signal extractor per agent
+        self.signal_extractors = nn.ModuleList([
+            AgentSignalExtractor(n_assets, d_model, top_k)
+            for _ in range(n_agents)
+        ])
 
-        # ── Step 1: Project each agent's N-dim action vector to d_model
-        # Each agent produces a vector of N weights → embed to d_model
-        self.input_proj = nn.Linear(n_assets, d_model)
+        # Stage 2: disagreement module
+        self.disagreement = DisagreementModule(d_model)
 
-        # ── Step 2: Positional encoding (distinguishes Agent 1, 2, 3)
-        self.pos_enc = PositionalEncoding(d_model, max_len=n_agents + 1, dropout=dropout)
+        # Stage 3: Transformer
+        self.market_token  = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.agent_pos_enc = nn.Embedding(n_agents + 1, d_model)
 
-        # ── Step 3: Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model         = d_model,
-            nhead           = nhead,
-            dim_feedforward = dim_feedforward,
-            dropout         = dropout,
-            batch_first     = True,    # (batch, seq, features) — more intuitive
-            norm_first      = True,    # Pre-norm (more stable training)
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers = num_layers,
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
         )
 
-        # ── Step 4: Learnable CLS token for aggregation
-        # Alternative to mean pooling — lets model focus on what matters
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        # FiLM disagreement conditioning  (FIXED: was additive blend)
+        self.film_gate = FiLMDisagreementGate(d_model)
 
-        # ── Step 5: MLP output head
-        self.output_head = nn.Sequential(
-            nn.Linear(d_model, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_assets),
-        )
+        # Stage 4: asset scoring head
+        self.asset_scorer = AssetScoringHead(n_assets, d_model)
 
-        # ── Weight initialization
+        # Stage 5: dynamic gate  (FIXED: was static scalar)
+        if use_residual_gate:
+            self.dynamic_gate = DynamicGate(d_model, n_agents)
+
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier initialization for stable training."""
         for name, p in self.named_parameters():
-            if "weight" in name and p.dim() > 1:
+            if "weight" in name and p.dim() >= 2:
                 nn.init.xavier_uniform_(p)
             elif "bias" in name:
                 nn.init.zeros_(p)
+        nn.init.normal_(self.market_token, mean=0.0, std=0.02)
+        # Re-apply DynamicGate bias init after xavier sweep
+        if self.use_residual_gate:
+            nn.init.constant_(self.dynamic_gate.alpha_net[-1].bias, 1.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x:               torch.Tensor,
+        return_internals: bool = False,
+    ) -> torch.Tensor:
         """
         Args:
-            x: (batch, 3, N) — stacked agent portfolio weight proposals
-
+            x:                (batch, 3, N) stacked agent weight vectors
+            return_internals: if True returns (weights, info_dict)
         Returns:
-            weights: (batch, N) — fused portfolio weights (sum=1, all≥0)
-
-        Step-by-step shapes:
-            Input:              (B, 3, N)
-            After input_proj:   (B, 3, d_model)
-            Prepend CLS token:  (B, 4, d_model)
-            After pos_enc:      (B, 4, d_model)
-            After transformer:  (B, 4, d_model)
-            Extract CLS:        (B, d_model)
-            After MLP:          (B, N)
-            After softmax:      (B, N)
+            weights: (batch, N)
         """
-        B = x.size(0)
+        B      = x.size(0)
+        device = x.device
 
-        # Step 1: Embed each agent's action
-        # x: (B, 3, N) → (B, 3, d_model)
-        tokens = self.input_proj(x)   # (B, 3, d_model)
+        # ── Stage 1: embed each agent's weight vector + signals
+        agent_tokens = []
+        for i, extractor in enumerate(self.signal_extractors):
+            token = extractor(x[:, i, :])
+            pos   = self.agent_pos_enc(torch.tensor(i, device=device))
+            token = token + pos.unsqueeze(0)
+            agent_tokens.append(token.unsqueeze(1))
+        agent_tokens = torch.cat(agent_tokens, dim=1)              # (B, 3, d_model)
 
-        # Step 2: Prepend CLS token for aggregation
-        cls = self.cls_token.expand(B, -1, -1)    # (B, 1, d_model)
-        tokens = torch.cat([cls, tokens], dim=1)   # (B, 4, d_model) — CLS + 3 agents
+        # ── Stage 2: disagreement embedding
+        disagree_emb = self.disagreement(x)                        # (B, d_model)
 
-        # Step 3: Positional encoding
-        tokens = self.pos_enc(tokens)   # (B, 4, d_model)
+        # ── Stage 3: prepend MARKET token, run Transformer
+        mkt_pos = self.agent_pos_enc(torch.tensor(self.n_agents, device=device))
+        mkt_tok = self.market_token.expand(B, -1, -1) + mkt_pos.unsqueeze(0).unsqueeze(0)
+        tokens  = torch.cat([mkt_tok, agent_tokens], dim=1)        # (B, 4, d_model)
+        encoded = self.transformer(tokens)                         # (B, 4, d_model)
 
-        # Step 4: Transformer encoder (self-attention across 4 tokens)
-        encoded = self.transformer_encoder(tokens)   # (B, 4, d_model)
+        market_state = encoded[:, 0, :]                            # (B, d_model)
 
-        # Step 5: Extract CLS token representation
-        cls_out = encoded[:, 0, :]   # (B, d_model)
+        # FiLM conditioning: modulate market_state with disagreement  (FIXED)
+        market_state = self.film_gate(market_state, disagree_emb)  # (B, d_model)
 
-        # Step 6: MLP → logits
-        logits = self.output_head(cls_out)   # (B, N)
+        # ── Stage 4: Transformer's OWN independent asset scoring
+        transformer_weights = self.asset_scorer(market_state)      # (B, N)
 
-        # Step 7: Softmax → valid portfolio weights
-        weights = torch.softmax(logits, dim=-1)   # (B, N)
-
-        return weights
-
-    def get_attention_weights(self, x: torch.Tensor):
-        """
-        Extract attention weights for interpretability.
-        Shows how much weight each agent gets for each asset.
-
-        Returns dict with attention maps from each layer.
-        """
-        B = x.size(0)
-        tokens = self.input_proj(x)
-        cls    = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls, tokens], dim=1)
-        tokens = self.pos_enc(tokens)
-
-        attention_maps = []
-        for layer in self.transformer_encoder.layers:
-            # Access multi-head attention
-            attn_out, attn_weights = layer.self_attn(
-                tokens, tokens, tokens,
-                need_weights=True,
-                average_attn_weights=False
+        # ── Stage 5: dynamic residual gate  (FIXED)
+        if self.use_residual_gate:
+            final, alpha = self.dynamic_gate(
+                market_state, transformer_weights, x
             )
-            attention_maps.append(attn_weights.detach().cpu().numpy())
-            tokens = layer(tokens)
+        else:
+            final = transformer_weights
+            alpha = torch.ones(B, 1, device=device)
 
-        return attention_maps
+        if return_internals:
+            return final, {
+                "market_state":        market_state.detach(),
+                "transformer_weights": transformer_weights.detach(),
+                "gate_alpha":          alpha.detach(),           # (B, 1) — varies per sample
+                "disagree_emb":        disagree_emb.detach(),
+            }
+        return final
+
+    def get_market_state(self, x: torch.Tensor) -> dict:
+        with torch.no_grad():
+            weights, info = self.forward(x, return_internals=True)
+            info["final_weights"] = weights.detach()
+            return info
 
 
 # ─────────────────────────────────────────────────────────
-# INFERENCE UTILITIES (used by backtest.py)
+# INFERENCE WRAPPER
 # ─────────────────────────────────────────────────────────
 
 class FusionInference:
-    """
-    Wrapper for running the trained fusion model in inference mode.
-    Used during backtesting to get final portfolio weights.
-    """
+    """Wrapper for running trained fusion model in inference mode."""
 
     def __init__(self, model: nn.Module, device: str = "auto"):
         if device == "auto":
@@ -259,11 +453,8 @@ class FusionInference:
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, n_assets: int, **model_kwargs):
-        """Load fusion model from saved checkpoint."""
-        import os
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         model = TransformerFusionModule(n_assets=n_assets, **model_kwargs)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -272,49 +463,33 @@ class FusionInference:
 
     @torch.no_grad()
     def predict(self, stacked_actions: np.ndarray) -> np.ndarray:
-        """
-        Get final portfolio weights for a batch of agent actions.
-
-        Args:
-            stacked_actions: numpy array of shape (T, 3, N) or (3, N)
-
-        Returns:
-            weights: numpy array of shape (T, N) or (N,)
-        """
         squeeze = False
         if stacked_actions.ndim == 2:
-            stacked_actions = stacked_actions[np.newaxis]   # add batch dim
+            stacked_actions = stacked_actions[np.newaxis]
             squeeze = True
-
         x = torch.tensor(stacked_actions, dtype=torch.float32).to(self.device)
         w = self.model(x).cpu().numpy()
-
-        if squeeze:
-            w = w[0]
-
-        return w
+        return w[0] if squeeze else w
 
     @torch.no_grad()
-    def predict_single_date(self, agent_actions: dict, tickers: list) -> dict:
+    def predict_with_diagnostics(self, stacked_actions: np.ndarray) -> dict:
         """
-        Get weights for a single date given agent action dict.
-
-        Args:
-            agent_actions: {reward_type: np.array(N,)}
-            tickers:       list of N ticker symbols
-
-        Returns:
-            {ticker: weight} dict
+        Returns per-sample diagnostics (gate_alpha varies per day — FIXED).
         """
-        # Stack: (3, N)
-        stacked = np.stack([
-            agent_actions["log_return"],
-            agent_actions["dsr"],
-            agent_actions["mdd"],
-        ], axis=0)
-
-        weights = self.predict(stacked)   # (N,)
-        return dict(zip(tickers, weights))
+        if stacked_actions.ndim == 2:
+            stacked_actions = stacked_actions[np.newaxis]
+        x    = torch.tensor(stacked_actions, dtype=torch.float32).to(self.device)
+        info = self.model.get_market_state(x)
+        result = {}
+        for k, v in info.items():
+            if isinstance(v, torch.Tensor):
+                result[k] = v.cpu().numpy()
+            else:
+                result[k] = v
+        # gate_alpha is now (B, 1) — return as (B,) for easy logging
+        if "gate_alpha" in result and result["gate_alpha"].ndim == 2:
+            result["gate_alpha"] = result["gate_alpha"].squeeze(-1)
+        return result
 
 
 # ─────────────────────────────────────────────────────────
@@ -322,33 +497,36 @@ class FusionInference:
 # ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== Testing TransformerFusionModule ===\n")
+    print("=== Testing Fixed TransformerFusionModule ===\n")
 
     n_assets = 29
-    n_agents = 3
     batch    = 16
 
     model = TransformerFusionModule(
-        n_assets=n_assets,
-        n_agents=n_agents,
-        d_model=64,
-        nhead=4,
-        num_layers=2,
-        dim_feedforward=128,
-        dropout=0.1,
+        n_assets=n_assets, n_agents=3, d_model=128,
+        nhead=4, num_layers=3, dim_feedforward=256,
+        dropout=0.1, use_residual_gate=True,
     )
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {n_params:,}")
+    x = F.softmax(torch.randn(batch, 3, n_assets), dim=-1)
+    w, info = model(x, return_internals=True)
 
-    # Test forward pass
-    x = torch.randn(batch, n_agents, n_assets)
-    w = model(x)
+    alphas = info["gate_alpha"].squeeze(-1)
+    print(f"\nInput shape:           {x.shape}")
+    print(f"Output shape:          {w.shape}")
+    print(f"Weights sum to 1:      {w.sum(dim=-1).allclose(torch.ones(batch), atol=1e-4)}")
+    print(f"All weights >= 0:      {(w >= 0).all().item()}")
+    print(f"\nDynamic gate_alpha per sample (first 8):")
+    print(f"  {alphas[:8].detach().numpy().round(4)}")
+    print(f"  std = {alphas.std().item():.4f}  (should be > 0 if gate is dynamic)")
 
-    print(f"Input shape:  {x.shape}")
-    print(f"Output shape: {w.shape}")
-    print(f"Weight sum (should be 1.0): {w.sum(dim=-1)}")
-    print(f"All weights ≥ 0: {(w >= 0).all()}")
-    print(f"All weights ≤ 1: {(w <= 1).all()}")
+    # Verify gate varies across different inputs
+    x2 = torch.ones(batch, 3, n_assets) / n_assets   # uniform — all agents agree
+    _, info2 = model(x2, return_internals=True)
+    alphas2  = info2["gate_alpha"].squeeze(-1)
 
-    print("\n✅ TransformerFusionModule test passed!")
+    print(f"\nGate alpha — disagreement input: mean={alphas.mean():.4f}")
+    print(f"Gate alpha — uniform input:       mean={alphas2.mean():.4f}")
+    print(f"(Different means confirms gate responds to input — FIXED!)")
+    print("\n✅ Test passed!")

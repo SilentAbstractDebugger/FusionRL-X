@@ -128,35 +128,69 @@ def generate_test_actions(agents, state_df, close_df):
 
 def run_fusion_inference(stacked_actions, dates, tickers, n_assets):
     """
-    Run Transformer fusion on test set agent actions.
-    Returns final RA-DRL portfolio weights for each test date.
+    Run Market-Predictive Transformer on test set agent actions.
+    Also saves diagnostic info: gate_alpha, disagreement patterns.
     """
-    print("\n🔀 Running Transformer Fusion inference...")
+    print("\n🔀 Running Market-Predictive Transformer Fusion...")
 
-    # Load fusion model
     ckpt_path = os.path.join(MODEL_DIR, "transformer_fusion_pretrained.pt")
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(MODEL_DIR, "cnn_fusion_pretrained.pt")
-        print(f"  ⚠️  Using CNN fusion (Transformer not found)")
 
     if not os.path.exists(ckpt_path):
-        print("  ❌ No fusion model found! Using equal-weight fallback.")
+        print("  ❌ No fusion model found! Run fusion/supervised_pretraining.py first.")
         N = n_assets
         weights = np.tile(np.ones(N) / N, (len(dates), 1))
         return pd.DataFrame(weights, index=dates, columns=tickers)
 
-    fusion = FusionInference.from_checkpoint(
-        checkpoint_path = ckpt_path,
-        n_assets        = n_assets,
-        **FUSION_CONFIG,
-    )
+    # Load model
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    from fusion.transformer_fusion import TransformerFusionModule, FusionInference
+    model = TransformerFusionModule(n_assets=n_assets, **FUSION_CONFIG)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    fusion = FusionInference(model)
 
-    # Predict for all test dates
-    weights = fusion.predict(stacked_actions)   # (T, N)
+    # Get weights + diagnostics for every date
+    # FIX: collect per-sample alpha and disagree_norm (not batch averages)
+    print(f"  Running inference on {len(dates)} test dates...")
+    weights_list   = []
+    gate_alphas    = []   # now a flat list of per-sample values
+    disagree_norms = []   # now a flat list of per-sample values
 
+    batch_size = 64
+    for i in range(0, len(dates), batch_size):
+        batch = stacked_actions[i:i+batch_size]
+        diag  = fusion.predict_with_diagnostics(batch)
+        weights_list.append(diag["final_weights"])
+
+        # gate_alpha is now (batch,) from the fixed FusionInference — collect per sample
+        alpha_batch = diag.get("gate_alpha", np.ones(len(batch)))
+        if np.ndim(alpha_batch) == 0:
+            # old scalar fallback — broadcast to batch size
+            alpha_batch = np.full(len(batch), float(alpha_batch))
+        gate_alphas.extend(alpha_batch.tolist())
+
+        # Per-sample disagreement norm (axis=-1 gives one value per sample)
+        if "disagree_emb" in diag:
+            d_norms = np.linalg.norm(diag["disagree_emb"], axis=-1)  # (batch,)
+            disagree_norms.extend(d_norms.tolist())
+
+    weights    = np.concatenate(weights_list, axis=0)
     weights_df = pd.DataFrame(weights, index=dates, columns=tickers)
-    print(f"  ✅ Fusion weights shape: {weights_df.shape}")
-    print(f"     Row-sum check (should be ~1.0): {weights_df.sum(axis=1).describe()['mean']:.4f}")
+
+    avg_alpha = float(np.mean(gate_alphas))
+    print(f"  ✅ Fusion complete")
+    print(f"     Gate α — mean={avg_alpha:.4f}, std={np.std(gate_alphas):.4f}  "
+          f"(std > 0.01 means gate is dynamic)")
+    print(f"     Weight sum check (should be ~1): {weights_df.sum(axis=1).mean():.6f}")
+
+    # Save per-date diagnostics (now varies by day — not a constant column)
+    diag_df = pd.DataFrame({
+        "date":         dates,
+        "gate_alpha":   gate_alphas if len(gate_alphas) == len(dates) else [avg_alpha] * len(dates),
+        "disagree_norm": disagree_norms if len(disagree_norms) == len(dates) else [0.0] * len(dates),
+    })
+    diag_df.to_csv(os.path.join(RESULT_DIR, "fusion_diagnostics.csv"), index=False)
 
     return weights_df
 

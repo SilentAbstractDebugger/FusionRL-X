@@ -1,42 +1,42 @@
 """
-fusion/supervised_pretraining.py
-──────────────────────────────────
-Supervised pre-training of the fusion module (CNN in paper; Transformer in your version).
+fusion/supervised_pretraining.py  (Fixed Version)
+───────────────────────────────────────────────────
+Supervised pre-training of the Transformer fusion module.
 
-WHY SUPERVISED PRE-TRAINING?
-────────────────────────────
-The Transformer/CNN fusion module needs to learn HOW to weigh the 3 agents' outputs.
-Pure RL training of the fusion is unstable (sparse rewards, high variance).
+WHAT WAS WRONG WITH THE ORIGINAL TRAINING:
+───────────────────────────────────────────
+Original loss:  MSE(predicted_weights, gt_weights)  only
 
-The paper's solution: Pre-train the fusion module in a SUPERVISED fashion using
-historical "ground truth" optimal weights.
+The MSE loss teaches the model to MATCH ground-truth weights, but it gives
+ZERO gradient signal to the dynamic gate (alpha_net) because:
+  - Any fixed alpha value produces the same MSE if the transformer and
+    agent blend are individually close to GT.
+  - The gate has no incentive to vary — it sits at its initialisation.
 
-GROUND TRUTH WEIGHT FORMULA (Paper Equation 1):
-  w_{i,t} = exp(ρ_{i,t} × c) / Σ_j exp(ρ_{j,t} × c)
+THE FIX — Three-component loss:
+────────────────────────────────
+  L = λ_mse  × MSE(pred, gt)                   ← original: match GT weights
+    + λ_sharp × SharpeApprox(pred, next_returns) ← NEW: reward good risk/return
+    + λ_gate  × GateEntropyReg(alpha)           ← NEW: force gate to vary
 
-  where:
-    ρ_{i,t} = percentage change in price of stock i at time t
-              = (P_{i,t} - P_{i,t-1}) / P_{i,t-1}
-    c = constant ∈ {1, 2, 3, 4, 5}  [we use c=3 from config]
+1. MSE loss (unchanged): aligns predicted weights with oracle GT.
 
-  INTUITION: Assets with HIGHER recent returns get HIGHER weight.
-  This is a RETROSPECTIVE oracle — it knows which stocks did well.
-  Used only to initialize the fusion module parameters.
+2. Sharpe Approximation loss (new):
+   We compute approximate 1-step portfolio returns using NEXT day's
+   percentage changes and penalise low Sharpe in a differentiable way:
+     approx_return = (pred_weights * next_day_returns).sum(dim=-1)
+     L_sharpe = -(mean(r) / (std(r) + eps))          ← maximise Sharpe
+   This gives a direct gradient signal to the gate: if blending more
+   with a particular agent produces better Sharpe, alpha adjusts.
 
-  After pre-training, the fusion module refines itself during RL training.
+3. Gate Entropy Regulariser (new):
+   We want alpha to VARY across samples, not collapse to a constant.
+   We maximise the entropy of the alpha distribution in each mini-batch:
+     L_gate = -H(alpha)   where H = -mean( α log α + (1-α) log(1-α) )
+   This explicitly punishes alpha converging to a single value.
 
-SUPERVISED TRAINING PROCESS:
-  Input:  Stacked agent actions → shape (batch, 3, N)
-  Target: Ground-truth weights  → shape (batch, N)
-  Loss:   MSE between predicted weights and GT weights
-  
-  This teaches the fusion module: "given what each specialized agent wants,
-  output the historically best allocation."
-
-YOUR PARTNER'S TRANSFORMER (handles the forward pass here):
-  Input: (batch, 3, N) — 3 agents × N assets
-  The Transformer attends across the 3 agents, weighing their contributions.
-  Output: (batch, N) — fused portfolio weights
+IMPORTANT: Sharpe loss requires next-day returns, so the dataset now
+includes an aligned next_returns tensor alongside stacked_actions.
 """
 
 import os
@@ -58,7 +58,7 @@ from config import (
 
 
 # ─────────────────────────────────────────────────────────
-# GROUND TRUTH WEIGHT COMPUTATION
+# GROUND TRUTH WEIGHT COMPUTATION  (unchanged)
 # ─────────────────────────────────────────────────────────
 
 def compute_ground_truth_weights(
@@ -67,184 +67,130 @@ def compute_ground_truth_weights(
 ) -> pd.DataFrame:
     """
     Compute ground-truth portfolio weights using paper Eq. (1).
-
     w_{i,t} = softmax(ρ_{i,t} × c)
-
-    where ρ_{i,t} = percentage price change of stock i at time t.
-
-    Args:
-        close_df: (T × N) closing prices
-        c:        scaling constant (paper uses 1-5, we use 3)
-
-    Returns:
-        gt_weights: (T × N) DataFrame of ground-truth weights
-                    Note: day t's weight uses day t's percentage change
-                    (retrospective oracle — only for pre-training)
     """
-    # Daily percentage returns
-    pct_change = close_df.pct_change().fillna(0)  # ρ_{i,t}
-
-    # Compute softmax weights per day
-    scaled = pct_change * c          # ρ × c
-    # Numerical stability: subtract row max before exp
-    scaled_np = scaled.values
-    scaled_np = scaled_np - scaled_np.max(axis=1, keepdims=True)
-    exp_vals  = np.exp(scaled_np)
-    weights   = exp_vals / (exp_vals.sum(axis=1, keepdims=True) + 1e-10)
+    pct_change = close_df.pct_change().fillna(0)
+    scaled_np  = (pct_change * c).values
+    scaled_np  = scaled_np - scaled_np.max(axis=1, keepdims=True)
+    exp_vals   = np.exp(scaled_np)
+    weights    = exp_vals / (exp_vals.sum(axis=1, keepdims=True) + 1e-10)
 
     gt_weights = pd.DataFrame(
-        weights,
-        index   = close_df.index,
-        columns = close_df.columns,
+        weights, index=close_df.index, columns=close_df.columns
     )
-
-    # Validate: each row sums to 1
-    row_sums = gt_weights.sum(axis=1)
-    assert np.allclose(row_sums, 1.0, atol=1e-5), "GT weights don't sum to 1!"
-
+    assert np.allclose(gt_weights.sum(axis=1), 1.0, atol=1e-5)
     return gt_weights
 
 
 # ─────────────────────────────────────────────────────────
-# PYTORCH DATASET
+# PYTORCH DATASET  (extended: now includes next-day returns)
 # ─────────────────────────────────────────────────────────
 
 class FusionDataset(Dataset):
     """
-    Dataset for supervised pre-training of fusion module.
+    Dataset for supervised pre-training.
 
     Each sample:
-        X: stacked agent actions → shape (3, N) — 3 agents, N assets
-        y: ground-truth weights  → shape (N,)
+        X:            stacked agent actions  → (3, N)
+        y:            ground-truth weights   → (N,)
+        next_returns: next-day pct changes   → (N,)  ← NEW for Sharpe loss
     """
 
     def __init__(
         self,
-        stacked_actions: np.ndarray,   # shape (T, 3, N)
-        gt_weights:      np.ndarray,   # shape (T, N)
+        stacked_actions: np.ndarray,   # (T, 3, N)
+        gt_weights:      np.ndarray,   # (T, N)
+        next_returns:    np.ndarray,   # (T, N)  ← next-day percentage returns
     ):
-        assert stacked_actions.shape[0] == gt_weights.shape[0], \
-            f"Length mismatch: actions {stacked_actions.shape[0]} vs GT {gt_weights.shape[0]}"
+        assert stacked_actions.shape[0] == gt_weights.shape[0]
+        assert stacked_actions.shape[0] == next_returns.shape[0]
 
         self.X = torch.tensor(stacked_actions, dtype=torch.float32)
         self.y = torch.tensor(gt_weights,      dtype=torch.float32)
+        self.r = torch.tensor(next_returns,    dtype=torch.float32)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.X[idx], self.y[idx], self.r[idx]
 
 
 # ─────────────────────────────────────────────────────────
-# CNN FUSION MODULE (paper's original — for reference)
+# LOSS FUNCTIONS
 # ─────────────────────────────────────────────────────────
 
-class CNNFusionModule(nn.Module):
+def sharpe_approx_loss(
+    pred_weights: torch.Tensor,   # (B, N)
+    next_returns: torch.Tensor,   # (B, N)
+    eps: float = 1e-6,
+) -> torch.Tensor:
     """
-    Paper's original CNN fusion module.
-    Kept here for reference and ablation studies.
+    Differentiable approximation to negative Sharpe ratio.
+    Minimising this = maximising Sharpe.
 
-    Architecture (from paper Fig. 2 + Fig. 3):
-    Input: (batch, 1, 3, N)  — 1 channel, 3 agents, N assets
-    Conv2D(kernel=(1,3))     → extracts cross-agent features per asset
-    Flatten → FC layers      → output weights (N,)
-
-    The (1,3) kernel means:
-      - Height=1: looks at ONE asset at a time
-      - Width=3:  looks at ALL 3 agent outputs for that asset
-    This lets the network learn: "given all 3 agents' opinions on stock i,
-    what weight should we give stock i?"
+    portfolio_return[b] = sum_i( pred_weights[b,i] * next_returns[b,i] )
+    L = -(mean(r) / (std(r) + eps))
     """
+    port_returns = (pred_weights * next_returns).sum(dim=-1)   # (B,)
+    mean_r = port_returns.mean()
+    std_r  = port_returns.std() + eps
+    return -(mean_r / std_r)
 
-    def __init__(self, n_assets: int, n_agents: int = 3):
-        super().__init__()
-        self.n_assets = n_assets
-        self.n_agents = n_agents
 
-        # (1,3) kernel: height=1 (one asset), width=3 (three agents)
-        self.conv = nn.Conv2d(
-            in_channels  = 1,
-            out_channels = 32,
-            kernel_size  = (1, n_agents),   # (1, 3)
-            stride       = 1,
-            padding      = 0,
-        )
+def gate_entropy_regulariser(alpha: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Negative binary entropy of the gate values in a mini-batch.
+    Minimising this = maximising entropy = forcing alpha to VARY.
 
-        # After conv: (batch, 32, N, 1) → flatten to (batch, 32*N)
-        flat_size = 32 * n_assets
+    H(alpha) = -mean( α log α + (1-α) log(1-α) )
+    L_gate   = -H(alpha)
 
-        self.mlp = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flat_size, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_assets),
-            nn.Softmax(dim=-1),   # weights sum to 1
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, 3, N) stacked agent actions
-        Returns:
-            weights: (batch, N) portfolio weights
-        """
-        # Add channel dim: (batch, 1, 3, N)
-        # Then permute for Conv2D: (batch, 1, N, 3)
-        # So kernel (1,3) processes all 3 agent outputs per asset
-        x = x.unsqueeze(1)              # (batch, 1, 3, N)
-        x = x.permute(0, 1, 3, 2)      # (batch, 1, N, 3)
-        x = self.conv(x)                # (batch, 32, N, 1)
-        return self.mlp(x)
+    Args:
+        alpha: (B, 1) gate values in (0, 1)
+    """
+    a   = alpha.clamp(eps, 1.0 - eps).squeeze(-1)   # (B,)
+    ent = -(a * a.log() + (1 - a) * (1 - a).log())  # (B,) — per-sample entropy
+    return -ent.mean()                               # negative = loss to minimise
 
 
 # ─────────────────────────────────────────────────────────
-# SUPERVISED PRE-TRAINING
+# SUPERVISED PRE-TRAINING  (FIXED)
 # ─────────────────────────────────────────────────────────
 
 def pretrain_fusion_module(
-    fusion_model: nn.Module,
-    stacked_actions: np.ndarray,  # (T, 3, N)
-    gt_weights: np.ndarray,       # (T, N)
-    config: dict = FUSION_CONFIG,
-    save_name: str = "fusion_pretrained",
+    fusion_model:    nn.Module,
+    stacked_actions: np.ndarray,   # (T, 3, N)
+    gt_weights:      np.ndarray,   # (T, N)
+    next_returns:    np.ndarray,   # (T, N)  ← NEW required argument
+    config:          dict = FUSION_CONFIG,
+    save_name:       str  = "fusion_pretrained",
+    lambda_mse:      float = 1.0,
+    lambda_sharpe:   float = 0.3,
+    lambda_gate:     float = 0.1,
 ) -> nn.Module:
     """
-    Supervised pre-training of any fusion module (CNN or Transformer).
-
-    Loss = MSE(predicted_weights, gt_weights)
-
-    After this, the fusion module knows how to weigh agent contributions
-    based on what was historically optimal.
+    Three-component loss pre-training.
 
     Args:
-        fusion_model:    nn.Module (CNN or Transformer — from Partner 3)
-        stacked_actions: (T, 3, N) — agent actions
-        gt_weights:      (T, N)    — ground truth from paper Eq.(1)
-        config:          training hyperparameters
-        save_name:       filename for saved model
-
-    Returns:
-        Trained fusion_model
+        lambda_mse:    weight on MSE loss
+        lambda_sharpe: weight on Sharpe approximation loss
+        lambda_gate:   weight on gate entropy regulariser
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n🏋️  Pre-training Fusion Module (Supervised)")
-    print(f"   Device: {device}")
-    print(f"   Input shape:  (batch, 3, {stacked_actions.shape[2]})")
-    print(f"   Target shape: (batch, {gt_weights.shape[1]})")
-    print(f"   Epochs:       {config['epochs']}")
-    print(f"   Batch size:   {config['batch_size']}")
-    print(f"   LR:           {config['lr']}")
+    print(f"\n🏋️  Pre-training Fusion Module (Fixed Supervised Training)")
+    print(f"   Device:        {device}")
+    print(f"   Input shape:   (batch, 3, {stacked_actions.shape[2]})")
+    print(f"   Epochs:        {config['epochs']}")
+    print(f"   Loss weights:  MSE={lambda_mse}, Sharpe={lambda_sharpe}, Gate={lambda_gate}")
+    print(f"   >> Gate entropy loss forces alpha to vary (FIXED frozen gate)")
 
     fusion_model = fusion_model.to(device)
 
-    # ── Dataset + DataLoader
-    dataset    = FusionDataset(stacked_actions, gt_weights)
-    n_train    = int(0.9 * len(dataset))
-    n_val      = len(dataset) - n_train
+    # Dataset + loaders
+    dataset = FusionDataset(stacked_actions, gt_weights, next_returns)
+    n_train = int(0.9 * len(dataset))
+    n_val   = len(dataset) - n_train
 
     train_set, val_set = torch.utils.data.random_split(
         dataset, [n_train, n_val],
@@ -254,49 +200,77 @@ def pretrain_fusion_module(
     train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True)
     val_loader   = DataLoader(val_set,   batch_size=config["batch_size"], shuffle=False)
 
-    # ── Optimizer + Loss
-    optimizer  = optim.Adam(fusion_model.parameters(), lr=config["lr"])
-    scheduler  = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-    criterion  = nn.MSELoss()
+    optimizer = optim.AdamW(
+        fusion_model.parameters(),
+        lr=config["lr"],
+        weight_decay=config.get("weight_decay", 1e-4),
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config["epochs"], eta_min=1e-5
+    )
+    mse_criterion = nn.MSELoss()
 
-    # ── Training loop
-    train_losses = []
-    val_losses   = []
-    best_val     = float("inf")
-    best_state   = None
+    train_losses  = []
+    val_losses    = []
+    alpha_history = []   # track gate mean + std per epoch
+    best_val      = float("inf")
+    best_state    = None
 
     for epoch in range(1, config["epochs"] + 1):
-        # -- Train
+
+        # ── Train
         fusion_model.train()
-        train_loss = 0.0
-        for X_batch, y_batch in train_loader:
+        train_loss  = 0.0
+        epoch_alpha = []
+
+        for X_batch, y_batch, r_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
+            r_batch = r_batch.to(device)
 
             optimizer.zero_grad()
-            pred  = fusion_model(X_batch)
-            loss  = criterion(pred, y_batch)
+
+            # Forward with internals to get alpha
+            pred, internals = fusion_model(X_batch, return_internals=True)
+
+            # Three-component loss
+            l_mse    = mse_criterion(pred, y_batch)
+            l_sharpe = sharpe_approx_loss(pred, r_batch)
+            alpha    = internals["gate_alpha"]                    # (B, 1)
+            l_gate   = gate_entropy_regulariser(alpha)
+
+            loss = (lambda_mse   * l_mse
+                  + lambda_sharpe * l_sharpe
+                  + lambda_gate   * l_gate)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(fusion_model.parameters(), 1.0)
             optimizer.step()
+
             train_loss += loss.item()
+            epoch_alpha.append(alpha.detach().cpu().squeeze(-1))
 
         train_loss /= len(train_loader)
+        scheduler.step()
 
-        # -- Validate
+        # Track alpha statistics
+        all_alphas = torch.cat(epoch_alpha)
+        alpha_mean = all_alphas.mean().item()
+        alpha_std  = all_alphas.std().item()
+        alpha_history.append((alpha_mean, alpha_std))
+
+        # ── Validate
         fusion_model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
+            for X_batch, y_batch, r_batch in val_loader:
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.to(device)
+                r_batch = r_batch.to(device)
                 pred     = fusion_model(X_batch)
-                val_loss += criterion(pred, y_batch).item()
+                val_loss += mse_criterion(pred, y_batch).item()
         val_loss /= len(val_loader)
 
-        scheduler.step(val_loss)
-
-        # Save best
         if val_loss < best_val:
             best_val   = val_loss
             best_state = {k: v.cpu().clone() for k, v in fusion_model.state_dict().items()}
@@ -306,43 +280,72 @@ def pretrain_fusion_module(
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{config['epochs']} | "
-                  f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                  f"α mean={alpha_mean:.3f} std={alpha_std:.3f}")
 
-    # ── Load best weights
+    # Load best weights
     fusion_model.load_state_dict(best_state)
 
-    # ── Save
+    # Save
     save_path = os.path.join(MODEL_DIR, f"{save_name}.pt")
     torch.save({
         "model_state_dict": best_state,
         "train_losses":     train_losses,
         "val_losses":       val_losses,
+        "alpha_history":    alpha_history,
         "config":           config,
     }, save_path)
     print(f"\n  💾 Best model saved to {save_path}")
     print(f"  ✅ Best validation loss: {best_val:.6f}")
 
-    # ── Plot training curve
-    _plot_training_curve(train_losses, val_losses, save_name)
+    # Check gate is no longer frozen
+    final_alpha_std = alpha_history[-1][1]
+    if final_alpha_std < 0.01:
+        print("  ⚠️  WARNING: gate_alpha std still low — consider increasing lambda_gate")
+    else:
+        print(f"  ✅ Gate is dynamic: final α std = {final_alpha_std:.4f} (> 0.01 = healthy)")
 
+    _plot_training_curve(train_losses, val_losses, alpha_history, save_name)
     return fusion_model
 
 
-def _plot_training_curve(train_losses, val_losses, name):
-    """Save training loss plot."""
-    plt.figure(figsize=(10, 4))
-    plt.plot(train_losses, label="Train Loss", color="royalblue")
-    plt.plot(val_losses,   label="Val Loss",   color="tomato")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.title(f"Fusion Pre-training: {name}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+def _plot_training_curve(train_losses, val_losses, alpha_history, name):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+    # Loss plot
+    axes[0].plot(train_losses, label="Train Loss", color="royalblue")
+    axes[0].plot(val_losses,   label="Val Loss",   color="tomato")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title(f"Training Loss: {name}")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Gate alpha evolution
+    means = [a[0] for a in alpha_history]
+    stds  = [a[1] for a in alpha_history]
+    epochs = range(1, len(means) + 1)
+    axes[1].plot(epochs, means, color="green",  label="α mean")
+    axes[1].fill_between(
+        epochs,
+        [m - s for m, s in zip(means, stds)],
+        [m + s for m, s in zip(means, stds)],
+        alpha=0.2, color="green", label="α ± std"
+    )
+    axes[1].axhline(0.693, color="red", linestyle="--", alpha=0.5,
+                    label="frozen original (0.693)")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Gate Alpha (α)")
+    axes[1].set_title("Dynamic Gate Evolution (should vary)")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylim(0, 1)
+
     plt.tight_layout()
     path = os.path.join(MODEL_DIR, f"{name}_training_curve.png")
     plt.savefig(path, dpi=150)
     plt.close()
-    print(f"  📊 Training curve saved: {path}")
+    print(f"  📊 Training curve (with gate evolution) saved: {path}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -350,77 +353,84 @@ def _plot_training_curve(train_losses, val_losses, name):
 # ─────────────────────────────────────────────────────────
 
 def main():
-    """Run supervised pre-training pipeline."""
+    """Run fixed supervised pre-training pipeline."""
 
-    # ── Load features and close prices
     print("📂 Loading data...")
-    close_df  = pd.read_csv(
+    close_df = pd.read_csv(
         os.path.join(FEAT_DIR, "aligned_close.csv"), index_col=0, parse_dates=True
     )
-    tickers   = pd.read_csv(
+    tickers  = pd.read_csv(
         os.path.join(FEAT_DIR, "tickers.csv"), header=0
     ).iloc[:, 0].tolist()
 
     n_assets = len(tickers)
     print(f"  Assets: {n_assets}")
 
-    # ── Compute ground truth weights
+    # Ground truth weights (train period only)
     print("\n🎯 Computing ground truth weights...")
-    # Use only TRAINING period to prevent lookahead
     train_close = close_df[close_df.index <= TRAIN_END]
     gt_weights  = compute_ground_truth_weights(train_close, c=GT_CONSTANT_C)
-    print(f"  GT weights shape: {gt_weights.shape}")
-    print(f"  Row sum check:    {gt_weights.sum(axis=1).describe()}")
 
-    # ── Load stacked agent actions (train set)
+    # Next-day percentage returns (for Sharpe loss) — shift by 1 day
+    # next_returns[t] = pct_change on day t+1 (what you earn if you hold weights from day t)
+    pct_change   = train_close.pct_change().fillna(0)
+    next_returns = pct_change.shift(-1).fillna(0)   # (T, N)
+
+    # Stacked agent actions (train set)
     print("\n📋 Loading agent actions...")
-    actions_path = os.path.join(FEAT_DIR, "agent_actions_train")
+    actions_path    = os.path.join(FEAT_DIR, "agent_actions_train")
     stacked_actions = np.load(os.path.join(actions_path, "stacked_actions.npy"))
-    action_dates = pd.read_csv(
+    action_dates    = pd.read_csv(
         os.path.join(actions_path, "dates.csv"), parse_dates=["date"]
     )["date"].tolist()
 
-    print(f"  Stacked actions shape: {stacked_actions.shape}")  # (T, 3, N)
+    print(f"  Stacked actions shape: {stacked_actions.shape}")
 
-    # ── Align GT weights with agent action dates
-    gt_aligned = gt_weights.loc[gt_weights.index.isin(action_dates)]
-    common_idx = [d for d in action_dates if d in gt_aligned.index]
+    # Align GT weights, next_returns, and actions on common dates
+    gt_aligned   = gt_weights.loc[gt_weights.index.isin(action_dates)]
+    nr_aligned   = next_returns.loc[next_returns.index.isin(action_dates)]
+    common_dates = [d for d in action_dates if d in gt_aligned.index]
+    act_mask     = [d in gt_aligned.index for d in action_dates]
 
-    act_mask   = [d in gt_aligned.index for d in action_dates]
-    stacked_aligned = stacked_actions[[i for i, m in enumerate(act_mask) if m]]
-    gt_aligned_vals = gt_aligned.loc[common_idx].values
+    stacked_aligned  = stacked_actions[[i for i, m in enumerate(act_mask) if m]]
+    gt_aligned_vals  = gt_aligned.loc[common_dates].values
+    nr_aligned_vals  = nr_aligned.loc[common_dates].values
 
-    print(f"  Aligned shapes — Actions: {stacked_aligned.shape}, GT: {gt_aligned_vals.shape}")
+    print(f"  Aligned — Actions: {stacked_aligned.shape}, GT: {gt_aligned_vals.shape}, "
+          f"NextRet: {nr_aligned_vals.shape}")
 
-    # ── IMPORT PARTNER'S TRANSFORMER (with fallback to CNN)
+    # Load Transformer model
     try:
         from fusion.transformer_fusion import TransformerFusionModule
         fusion_model = TransformerFusionModule(
-            n_assets  = n_assets,
-            n_agents  = 3,
+            n_assets=n_assets,
+            n_agents=3,
             **FUSION_CONFIG
         )
-        print("\n✅ Using Transformer Fusion Module (Partner 3's implementation)")
+        print("\n✅ Using Fixed Transformer Fusion Module")
         save_name = "transformer_fusion_pretrained"
     except ImportError:
-        print("\n⚠️  TransformerFusionModule not found — using CNN (paper original)")
-        fusion_model = CNNFusionModule(n_assets=n_assets, n_agents=3)
-        save_name = "cnn_fusion_pretrained"
+        print("\n❌ TransformerFusionModule not found — check transformer_fusion.py")
+        return
 
-    # ── Pre-train
+    # Pre-train with fixed three-component loss
     pretrain_fusion_module(
         fusion_model    = fusion_model,
         stacked_actions = stacked_aligned,
         gt_weights      = gt_aligned_vals,
+        next_returns    = nr_aligned_vals,
         config          = FUSION_CONFIG,
         save_name       = save_name,
+        lambda_mse      = 1.0,
+        lambda_sharpe   = 0.3,
+        lambda_gate     = 0.1,
     )
 
-    # ── Also save GT weights for reference
+    # Save GT weights
     gt_weights.to_csv(os.path.join(FEAT_DIR, "ground_truth_weights.csv"))
     print(f"\n💾 Ground truth weights saved.")
-    print("\n🎉 Supervised pre-training complete!")
-    print(f"   Next step: run backtest.py")
+    print("\n🎉 Fixed supervised pre-training complete!")
+    print("   Next step: run backtest.py")
 
 
 if __name__ == "__main__":
