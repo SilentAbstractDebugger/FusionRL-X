@@ -58,7 +58,7 @@ class PPOPortfolioAgent:
         if eval_env is not None:
             self.eval_env = DummyVecEnv([lambda: Monitor(eval_env)])
 
-        # FIX: Dynamically read activation from config rather than hardcoding ReLU
+        # Dynamically read activation from config rather than hardcoding ReLU
         activation_str = config.get("policy_kwargs", {}).get("activation_fn", "relu").lower()
         activation_fn = nn.ReLU if activation_str == "relu" else nn.Tanh
         
@@ -68,8 +68,6 @@ class PPOPortfolioAgent:
             "activation_fn": activation_fn, 
         }
 
-        # FIX: Ensure fallbacks (.get) exist for parameters like max_grad_norm 
-        # to strictly protect against gradient explosions
         self.model = PPO(
             policy          = "MlpPolicy",   # standard Multi-Layer Perceptron policy
             env             = self.vec_env,
