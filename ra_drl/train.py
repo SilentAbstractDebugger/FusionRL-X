@@ -1,22 +1,3 @@
-"""
-train.py
-─────────
-MASTER TRAINING SCRIPT — Run this to train everything.
-
-This is the single entry point for the complete training pipeline.
-Run it in order:
-
-  python train.py --step 1   # Download data
-  python train.py --step 2   # Feature engineering
-  python train.py --step 3   # Train 3 PPO agents
-  python train.py --step 4   # Supervised pre-training of Transformer fusion
-  python train.py --all      # Run all steps sequentially
-
-TEAM RESPONSIBILITIES:
-  Steps 1-4: You two
-  Step 4 (fusion forward pass): Partner 3 implements transformer_fusion.py
-"""
-
 import os
 import sys
 import argparse
@@ -26,7 +7,7 @@ sys.path.append(os.path.abspath("."))
 
 
 def step1_download_data():
-    """Download Dow 30 OHLCV data from Yahoo Finance."""
+    # Downloading Dow 30 OHLCV data from Yahoo Finance.
     print("\n" + "═"*60)
     print("  STEP 1: DOWNLOAD DATA")
     print("═"*60)
@@ -35,7 +16,7 @@ def step1_download_data():
 
 
 def step2_feature_engineering():
-    """Compute technical indicators and covariance matrices."""
+     # Computing technical indicators and covariance matrices.
     print("\n" + "═"*60)
     print("  STEP 2: FEATURE ENGINEERING")
     print("═"*60)
@@ -45,7 +26,7 @@ def step2_feature_engineering():
 
 
 def step3_train_agents(use_hyperopt=True, timesteps=None):
-    """Train the 3 PPO agents with their respective reward functions."""
+    # Training the 3 PPO agents with their respective reward functions.
     print("\n" + "═"*60)
     print("  STEP 3: TRAIN PPO AGENTS")
     print("═"*60)
@@ -82,7 +63,7 @@ def step35_evaluate_agents():
         for result in check_results.values()
     )
     if critical_fail:
-        print("\n❌ PIPELINE HALTED — one or more agents critically failed.")
+        print("\n PIPELINE HALTED — one or more agents critically failed.")
         print("   Retrain with: python train.py --step 3 --no-skip --timesteps 750000")
         import sys; sys.exit(1)
 
@@ -112,7 +93,7 @@ def run_all(args):
     step4_supervised_pretrain()
 
     elapsed = time.time() - start
-    print(f"\n\n🎉 FULL TRAINING PIPELINE COMPLETE!")
+    print(f"\n\n FULL TRAINING PIPELINE COMPLETE!")
     print(f"   Total time: {elapsed/60:.1f} minutes")
     print(f"\n   Next: python backtest.py")
 
@@ -142,7 +123,7 @@ Examples:
 
     if not args.all and args.step is None:
         parser.print_help()
-        print("\n⚠️  Please specify --all or --step N")
+        print("\n Please specify --all or --step N")
         sys.exit(1)
 
     if args.all:
