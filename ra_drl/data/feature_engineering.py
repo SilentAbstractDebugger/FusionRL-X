@@ -122,16 +122,7 @@ def compute_all_indicators(close: pd.Series, high: pd.Series,
 
 def compute_rolling_covariance(close_matrix: pd.DataFrame,
                                 window: int = LOOKBACK_WINDOW) -> dict:
-    """
-    Compute rolling covariance matrix for each date.
 
-    Args:
-        close_matrix: (T × N) DataFrame of closing prices
-        window: lookback window in trading days (paper uses 60)
-
-    Returns:
-        dict {date: np.array(N×N)} — covariance matrix per date
-    """
     # Daily log returns
     log_returns = np.log(close_matrix / close_matrix.shift(1)).dropna()
 
@@ -207,12 +198,7 @@ class FeatureBuilder:
         print(f"  Covariance matrices computed for {len(self.cov_matrices)} dates")
 
     def build_state_dataframe(self):
-        """
-        Build a flat DataFrame where each row = state at that date.
-        Columns = [cov_0_0, cov_0_1, ..., cov_N_N, sma30_AAPL, sma60_AAPL, ...]
-
-        This flat representation is what the RL environment uses.
-        """
+    
         print("\n Building flat state DataFrame...")
 
         # Align all indicators to same dates
