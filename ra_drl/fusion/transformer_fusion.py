@@ -1,49 +1,3 @@
-"""
-fusion/transformer_fusion.py
-─────────────────────────────
-MARKET-PREDICTIVE TRANSFORMER FUSION  (Fixed Version)
-======================================================
-
-ROOT CAUSES OF THE FROZEN GATE (original bugs fixed here):
-───────────────────────────────────────────────────────────
-BUG 1 — Static scalar gate_alpha:
-  Original:  self.gate_alpha = nn.Parameter(torch.tensor(0.8))
-             alpha = torch.sigmoid(self.gate_alpha)   # → always ~0.693
-  Fix:       gate_alpha is now a DYNAMIC MLP that reads the market state
-             and outputs a per-sample alpha in (0,1). Each day gets its
-             own blend ratio based on how much the transformer "trusts itself".
-
-BUG 2 — disagree_norm in diagnostics is constant:
-  Original:  backtest.py averaged disagree_emb norm across a whole batch,
-             then assigned that same scalar to every date.
-  Fix:       predict_with_diagnostics now returns per-sample norms so
-             backtest.py can log a different value for each day.
-
-BUG 3 — MSE-only pretraining gives no gradient signal to the gate:
-  The gate_alpha never received a meaningful gradient because MSE loss
-  optimizes predicted weights regardless of what alpha is. The Transformer
-  could set alpha=anything and still minimise MSE.
-  Fix:       supervised_pretraining.py adds a Sharpe-approximation auxiliary
-             loss and a gate-entropy regulariser that force alpha to vary.
-
-BUG 4 — Disagreement gate uses additive blend of disagree_emb:
-  Original:  market_state = market_state * gate + disagree_emb * (1 - gate)
-             This corrupts market_state with raw disagree_emb values.
-  Fix:       disagree_emb modulates a learned shift/scale on market_state
-             (FiLM conditioning), preserving market_state magnitude.
-
-ARCHITECTURE (unchanged structure, fixed internals):
-─────────────────────────────────────────────────────
-  Input: (batch, 3, N)
-
-  Stage 1: SIGNAL EXTRACTION per agent          [unchanged]
-  Stage 2: DISAGREEMENT MODULE                  [unchanged]
-  Stage 3: CROSS-AGENT TRANSFORMER              [unchanged]
-  Stage 4: ASSET SCORING HEAD                   [unchanged]
-  Stage 5: DYNAMIC RESIDUAL GATE                [FIXED — was static scalar]
-            alpha(x) = sigmoid(MLP(market_state))   ← per-sample
-"""
-
 import os
 import sys
 import math
@@ -53,23 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────
-# STAGE 1: SIGNAL EXTRACTOR  (unchanged)
-# ─────────────────────────────────────────────────────────
+# Signal Extractor
 
 class AgentSignalExtractor(nn.Module):
-    """
-    Extracts implicit market signals from one agent's weight vector.
-
-    Analytical signals computed:
-      HHI        — how concentrated is the agent? (confidence measure)
-      Entropy    — how spread out? (uncertainty measure)
-      Top-K conc — fraction of weight in top K assets (conviction)
-      Max weight — dominant single pick
-      Min weight — how much does agent avoid worst asset
-      Std        — spread of conviction across assets
-    """
-
     def __init__(self, n_assets: int, d_model: int, top_k: int = 5):
         super().__init__()
         self.n_assets  = n_assets
@@ -106,18 +46,9 @@ class AgentSignalExtractor(nn.Module):
         return self.merge(torch.cat([w_emb, sig_emb], dim=-1))
 
 
-# ─────────────────────────────────────────────────────────
-# STAGE 2: DISAGREEMENT MODULE  (unchanged)
-# ─────────────────────────────────────────────────────────
+#Disagreement Module
 
 class DisagreementModule(nn.Module):
-    """
-    Computes pairwise disagreement between all 3 agent pairs.
-
-    Features per pair: cosine similarity, L1 distance, L2 distance
-    3 pairs × 3 features = 9 features total
-    """
-
     def __init__(self, d_model: int):
         super().__init__()
         self.proj = nn.Sequential(
@@ -138,22 +69,9 @@ class DisagreementModule(nn.Module):
         return self.proj(torch.cat(features, dim=-1))
 
 
-# ─────────────────────────────────────────────────────────
 # STAGE 2b: FiLM DISAGREEMENT CONDITIONING  (NEW — replaces additive blend)
-# ─────────────────────────────────────────────────────────
 
 class FiLMDisagreementGate(nn.Module):
-    """
-    FiLM (Feature-wise Linear Modulation) conditioning.
-
-    Instead of additively blending disagree_emb into market_state
-    (which corrupts its magnitude), we use disagree_emb to predict
-    a per-dimension scale γ and shift β applied to market_state:
-
-        modulated = γ(disagree_emb) ⊙ market_state + β(disagree_emb)
-
-    This lets disagreement *steer* the market state without overwriting it.
-    """
 
     def __init__(self, d_model: int):
         super().__init__()
@@ -173,9 +91,7 @@ class FiLMDisagreementGate(nn.Module):
         return gamma * market_state + beta
 
 
-# ─────────────────────────────────────────────────────────
 # STAGE 4: ASSET SCORING HEAD  (unchanged)
-# ─────────────────────────────────────────────────────────
 
 class AssetScoringHead(nn.Module):
     """
@@ -214,37 +130,9 @@ class AssetScoringHead(nn.Module):
         return F.softmax(bi_score + mlp_score, dim=-1)
 
 
-# ─────────────────────────────────────────────────────────
 # STAGE 5: DYNAMIC GATE  (NEW — replaces static scalar)
-# ─────────────────────────────────────────────────────────
 
 class DynamicGate(nn.Module):
-    """
-    Per-sample dynamic residual gate.
-
-    PROBLEM WITH THE ORIGINAL:
-      gate_alpha = nn.Parameter(torch.tensor(0.8))   # single scalar
-      alpha = torch.sigmoid(gate_alpha)              # ≈ 0.693 always
-
-      This is ONE number shared by ALL samples, ALL days.
-      The MSE pretraining loss has no incentive to change it because
-      the Transformer can hit near-optimal MSE with any fixed alpha.
-      Result: alpha never meaningfully updates → "frozen gate".
-
-    THE FIX:
-      alpha(x) = sigmoid( MLP( market_state ) )     # (B, 1) per sample
-
-      Now alpha depends on the market_state of each day:
-        - High transformer confidence → alpha → 1 (trust transformer more)
-        - High disagreement / uncertainty → alpha → 0 (blend more with agents)
-
-      This also means the gate receives informative gradients from both
-      the MSE loss AND the Sharpe auxiliary loss added in pretraining.
-
-    INITIALISATION:
-      MLP bias is initialised to +1.0 so sigmoid(+1) ≈ 0.73 at start,
-      close to the original 0.8 default — no cold-start instability.
-    """
 
     def __init__(self, d_model: int, n_agents: int):
         super().__init__()
@@ -292,21 +180,7 @@ class DynamicGate(nn.Module):
         return final, alpha
 
 
-# ─────────────────────────────────────────────────────────
-# MAIN MODULE
-# ─────────────────────────────────────────────────────────
-
 class TransformerFusionModule(nn.Module):
-    """
-    Market-Predictive Transformer Fusion (Fixed).
-
-    Key change from original:
-      gate_alpha is now a DynamicGate that outputs a per-sample alpha
-      based on the current market_state, instead of a frozen scalar.
-
-    Input:  (batch, 3, N) — 3 agent weight vectors
-    Output: (batch, N)    — Transformer's own portfolio weights
-    """
 
     def __init__(
         self,
@@ -379,13 +253,7 @@ class TransformerFusionModule(nn.Module):
         x:               torch.Tensor,
         return_internals: bool = False,
     ) -> torch.Tensor:
-        """
-        Args:
-            x:                (batch, 3, N) stacked agent weight vectors
-            return_internals: if True returns (weights, info_dict)
-        Returns:
-            weights: (batch, N)
-        """
+        
         B      = x.size(0)
         device = x.device
 
@@ -440,9 +308,7 @@ class TransformerFusionModule(nn.Module):
             return info
 
 
-# ─────────────────────────────────────────────────────────
 # INFERENCE WRAPPER
-# ─────────────────────────────────────────────────────────
 
 class FusionInference:
     """Wrapper for running trained fusion model in inference mode."""
@@ -460,7 +326,7 @@ class FusionInference:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         model = TransformerFusionModule(n_assets=n_assets, **model_kwargs)
         model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"  ✅ Fusion model loaded from {checkpoint_path}")
+        print(f" Fusion model loaded from {checkpoint_path}")
         return cls(model)
 
     @torch.no_grad()
@@ -493,10 +359,6 @@ class FusionInference:
             result["gate_alpha"] = result["gate_alpha"].squeeze(-1)
         return result
 
-
-# ─────────────────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=== Testing Fixed TransformerFusionModule ===\n")
@@ -531,4 +393,4 @@ if __name__ == "__main__":
     print(f"\nGate alpha — disagreement input: mean={alphas.mean():.4f}")
     print(f"Gate alpha — uniform input:       mean={alphas2.mean():.4f}")
     print(f"(Different means confirms gate responds to input — FIXED!)")
-    print("\n✅ Test passed!")
+    print("\n Test passed!")
