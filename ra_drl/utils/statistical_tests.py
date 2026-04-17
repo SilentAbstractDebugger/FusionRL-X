@@ -1,48 +1,9 @@
-"""
-utils/statistical_tests.py
-───────────────────────────
-PROPER STATISTICAL SIGNIFICANCE TESTS FOR PORTFOLIO STRATEGIES
-
-The paired t-test on daily returns is the WRONG test for portfolio comparison.
-Here is why and what to use instead:
-
-WHY DAILY RETURN t-TEST FAILS:
-  - Daily returns have σ ≈ 1% but the strategy difference is ~0.01%/day
-  - Signal-to-noise ratio ≈ 0.01/1.0 = 1% — you need ~10,000 days to detect this
-  - You have 813 days — statistically underpowered by design
-  - This is NOT a model failure. It is a property of financial data.
-
-WHAT THE LITERATURE ACTUALLY USES:
-  1. Sharpe Ratio Difference Test (Jobson-Korkie, 1981)
-     → Tests if SR_A > SR_B is statistically significant
-     → Works with small samples (813 days is fine)
-
-  2. Maximum Drawdown Comparison (Bootstrap)
-     → Tests if MDD_A < MDD_B is significant
-     → Uses bootstrap resampling — no normality assumption needed
-
-  3. Cumulative Return Significance (Block Bootstrap)
-     → Tests if CR_A > CR_B by resampling return blocks
-     → Preserves autocorrelation structure of returns
-
-  4. Omega Ratio Significance (Permutation Test)
-     → Non-parametric — makes no distribution assumptions
-     → Tests if OR_A > OR_B by random permutation
-
-These are the tests used in the RA-DRL paper and quantitative finance literature.
-"""
-
 import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.stats import norm
 import warnings
 warnings.filterwarnings("ignore")
-
-
-# ─────────────────────────────────────────────────────────
-# TEST 1: JOBSON-KORKIE SHARPE RATIO DIFFERENCE TEST
-# ─────────────────────────────────────────────────────────
 
 def jobson_korkie_test(
     returns_a: np.ndarray,
@@ -52,18 +13,6 @@ def jobson_korkie_test(
     name_a:    str   = "Strategy A",
     name_b:    str   = "Strategy B",
 ) -> dict:
-    """
-    Jobson-Korkie (1981) test for equality of Sharpe Ratios.
-    Memmel (2003) corrected version.
-
-    H0: SR_A = SR_B
-    H1: SR_A > SR_B  (one-sided)
-
-    This is the STANDARD test for comparing portfolio Sharpe ratios.
-    Works well with T ≈ 500-1000 observations.
-
-    Reference: Jobson & Korkie (1981), Memmel (2003)
-    """
     T  = len(returns_a)
     ra = returns_a - rf / annualize
     rb = returns_b - rf / annualize
@@ -113,11 +62,6 @@ def jobson_korkie_test(
         "name_b":  name_b,
     }
 
-
-# ─────────────────────────────────────────────────────────
-# TEST 2: BLOCK BOOTSTRAP CUMULATIVE RETURN TEST
-# ─────────────────────────────────────────────────────────
-
 def block_bootstrap_cr_test(
     returns_a:   np.ndarray,
     returns_b:   np.ndarray,
@@ -127,18 +71,6 @@ def block_bootstrap_cr_test(
     name_b:      str   = "Strategy B",
     seed:        int   = 42,
 ) -> dict:
-    """
-    Block Bootstrap test for cumulative return difference.
-
-    Standard t-test assumes IID returns — financial returns are autocorrelated.
-    Block bootstrap resamples BLOCKS of consecutive days (preserving 
-    autocorrelation) to build the null distribution of CR_A - CR_B.
-
-    H0: CR_A = CR_B
-    H1: CR_A > CR_B  (one-sided)
-
-    block_size = 21 (monthly blocks) is standard in the literature.
-    """
     rng = np.random.default_rng(seed)
     T   = min(len(returns_a), len(returns_b))
     ra  = returns_a[:T]
@@ -184,11 +116,6 @@ def block_bootstrap_cr_test(
         "name_b":  name_b,
     }
 
-
-# ─────────────────────────────────────────────────────────
-# TEST 3: PERMUTATION TEST FOR OMEGA RATIO
-# ─────────────────────────────────────────────────────────
-
 def permutation_omega_test(
     returns_a:     np.ndarray,
     returns_b:     np.ndarray,
@@ -198,20 +125,7 @@ def permutation_omega_test(
     name_b:        str   = "Strategy B",
     seed:          int   = 42,
 ) -> dict:
-    """
-    Non-parametric permutation test for Omega Ratio difference.
-
-    Omega Ratio captures the FULL return distribution (not just mean/variance).
-    This test makes NO distributional assumptions — ideal for fat-tailed
-    financial return distributions.
-
-    H0: OR_A = OR_B
-    H1: OR_A > OR_B
-
-    Under H0, pooled returns are exchangeable between strategies.
-    We randomly permute assignment and measure how often we see a
-    difference as large as observed.
-    """
+  
     rng = np.random.default_rng(seed)
 
     def omega(r, t=threshold):
@@ -254,11 +168,6 @@ def permutation_omega_test(
         "name_b":  name_b,
     }
 
-
-# ─────────────────────────────────────────────────────────
-# TEST 4: ORIGINAL PAIRED t-TEST (kept for paper compliance)
-# ─────────────────────────────────────────────────────────
-
 def paired_t_test_daily(
     returns_a: np.ndarray,
     returns_b: np.ndarray,
@@ -266,11 +175,6 @@ def paired_t_test_daily(
     name_b:    str   = "Strategy B",
     alpha:     float = 0.05,
 ) -> dict:
-    """
-    Standard paired t-test on daily returns (as in original paper).
-    Kept for completeness and paper compliance.
-    Note: Low power with 813 days — use Jobson-Korkie for Sharpe comparison.
-    """
     T  = min(len(returns_a), len(returns_b))
     t_stat, p_value = stats.ttest_rel(returns_a[:T], returns_b[:T])
     return {
@@ -283,28 +187,12 @@ def paired_t_test_daily(
         "note":           "Low power with <2000 obs. Use Jobson-Korkie for Sharpe test.",
     }
 
-
-# ─────────────────────────────────────────────────────────
-# RUN ALL TESTS — MASTER FUNCTION
-# ─────────────────────────────────────────────────────────
-
 def run_all_significance_tests(
     strategies:     dict,       # {name: pd.Series of portfolio values}
     ra_drl_name:    str   = "RA-DRL",
     rf:             float = 0.0525,
     print_results:  bool  = True,
 ) -> pd.DataFrame:
-    """
-    Run all 4 statistical tests: RA-DRL vs every other strategy.
-
-    Args:
-        strategies: {name: portfolio_value_series}
-        ra_drl_name: key for the RA-DRL strategy in the dict
-        rf: annual risk-free rate
-
-    Returns:
-        results_df: DataFrame with one row per (strategy_pair × test)
-    """
     ra_drl_values  = strategies[ra_drl_name]
     ra_drl_returns = ra_drl_values.pct_change().dropna().values
 
@@ -375,7 +263,7 @@ def run_all_significance_tests(
                 continue
             tests = rows.set_index("test")["significant"].to_dict()
 
-            def fmt(v): return "✅ sig" if v else "❌ ns "
+            def fmt(v): return "sig" if v else "ns "
 
             jk_key = "Jobson-Korkie Sharpe Ratio Test"
             bb_key = "Block Bootstrap Cumulative Return Test"
@@ -388,7 +276,7 @@ def run_all_significance_tests(
                   f"{fmt(tests.get(pm_key, False)):>12} "
                   f"{fmt(tests.get(pt_key, False)):>8}")
 
-        print("\n  KEY: ✅ sig = p < 0.05   ❌ ns = not significant")
+        print("\n  KEY: sig = p < 0.05   ns = not significant")
         print("  NOTE: Jobson-Korkie and Bootstrap tests are the standard in the")
         print("        portfolio optimization literature. Paired t-test on daily")
         print("        returns requires >5000 days for adequate power — use JK instead.")
@@ -396,10 +284,6 @@ def run_all_significance_tests(
 
     return results_df
 
-
-# ─────────────────────────────────────────────────────────
-# ENTRY POINT (standalone test)
-# ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys, os
