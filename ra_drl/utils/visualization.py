@@ -1,19 +1,3 @@
-"""
-utils/visualization.py
-───────────────────────
-All plots for the project report and paper figures.
-
-PLOTS:
-  1. Cumulative Wealth Curves   — all strategies on one chart
-  2. Metrics Comparison Bar Charts
-  3. Portfolio Weight Heatmap   — how RA-DRL allocates over time
-  4. Drawdown Plot              — drawdown periods for all strategies
-  5. Agent Contribution Plot    — how much each agent influences fusion
-  6. Rolling Sharpe Ratio
-
-All saved to results/ as high-resolution PNGs.
-"""
-
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,9 +59,7 @@ def _get_ls(name: str) -> str:
     return "-"
 
 
-# ─────────────────────────────────────────────────────────
 # PLOT 1: CUMULATIVE WEALTH CURVES
-# ─────────────────────────────────────────────────────────
 
 def plot_cumulative_wealth(
     strategies:   dict,          # {name: pd.Series of portfolio values}
@@ -134,14 +116,11 @@ def plot_cumulative_wealth(
     if save:
         path = os.path.join(RESULT_DIR, "01_cumulative_wealth.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────
 # PLOT 2: DRAWDOWN CHART
-# ─────────────────────────────────────────────────────────
 
 def plot_drawdowns(
     strategies:  dict,
@@ -149,10 +128,7 @@ def plot_drawdowns(
     figsize:     tuple = (14, 5),
     save:        bool  = True,
 ) -> plt.Figure:
-    """
-    Drawdown chart: shows peak-to-trough decline over time.
-    RA-DRL's drawdown should be smallest/shortest.
-    """
+ 
     fig, ax = plt.subplots(figsize=figsize)
 
     # Pick top strategies (include RA-DRL + top benchmarks)
@@ -197,25 +173,18 @@ def plot_drawdowns(
     if save:
         path = os.path.join(RESULT_DIR, "02_drawdowns.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────
 # PLOT 3: METRICS COMPARISON HEATMAP
-# ─────────────────────────────────────────────────────────
 
 def plot_metrics_heatmap(
     metrics_df:  pd.DataFrame,
     figsize:     tuple = (14, 6),
     save:        bool  = True,
 ) -> plt.Figure:
-    """
-    Heatmap of all metrics across all strategies.
-    Rows = strategies, Columns = metrics.
-    Darker = better.
-    """
+  
     # Select numeric columns
     numeric_cols = [c for c in metrics_df.columns if c not in ["Strategy"]]
     df = metrics_df[numeric_cols].copy()
@@ -260,14 +229,11 @@ def plot_metrics_heatmap(
     if save:
         path = os.path.join(RESULT_DIR, "03_metrics_heatmap.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────
 # PLOT 4: PORTFOLIO WEIGHT EVOLUTION (RA-DRL)
-# ─────────────────────────────────────────────────────────
 
 def plot_weight_evolution(
     weights_df:  pd.DataFrame,   # (T × N) — RA-DRL daily weights
@@ -275,10 +241,7 @@ def plot_weight_evolution(
     figsize:     tuple = (14, 6),
     save:        bool  = True,
 ) -> plt.Figure:
-    """
-    Stacked area chart showing how RA-DRL allocates capital over time.
-    Which assets dominate? Does allocation shift during market crises?
-    """
+  
     # Pick top N most actively allocated assets (by mean weight)
     top_assets = weights_df.mean().nlargest(top_n).index.tolist()
     df = weights_df[top_assets]
@@ -312,14 +275,11 @@ def plot_weight_evolution(
     if save:
         path = os.path.join(RESULT_DIR, "04_weight_evolution.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────
 # PLOT 5: ROLLING SHARPE RATIO
-# ─────────────────────────────────────────────────────────
 
 def plot_rolling_sharpe(
     strategies:  dict,
@@ -327,10 +287,7 @@ def plot_rolling_sharpe(
     figsize:     tuple = (14, 5),
     save:        bool  = True,
 ) -> plt.Figure:
-    """
-    Rolling Sharpe ratio over the test period.
-    Shows risk-adjusted performance stability over time.
-    """
+
     from config import RISK_FREE_RATE
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -374,14 +331,11 @@ def plot_rolling_sharpe(
     if save:
         path = os.path.join(RESULT_DIR, "05_rolling_sharpe.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
-
-# ─────────────────────────────────────────────────────────
 # PLOT 6: BAR CHART METRIC COMPARISON
-# ─────────────────────────────────────────────────────────
 
 def plot_metric_bars(
     metrics_df:  pd.DataFrame,
@@ -389,9 +343,7 @@ def plot_metric_bars(
     figsize:     tuple = (16, 10),
     save:        bool  = True,
 ) -> plt.Figure:
-    """
-    Bar charts for selected metrics, one subplot per metric.
-    """
+  
     n = len(metrics)
     fig, axes = plt.subplots(1, n, figsize=figsize, sharey=False)
 
@@ -423,19 +375,17 @@ def plot_metric_bars(
     if save:
         path = os.path.join(RESULT_DIR, "06_metric_bars.png")
         plt.savefig(path, dpi=200, bbox_inches="tight")
-        print(f"  💾 Saved: {path}")
+        print(f"  Saved: {path}")
 
     return fig
 
 
-# ─────────────────────────────────────────────────────────
 # MASTER FUNCTION
-# ─────────────────────────────────────────────────────────
 
 def plot_all(strategies: dict, metrics_df: pd.DataFrame):
     """Generate all plots at once."""
     os.makedirs(RESULT_DIR, exist_ok=True)
-    print(f"\n🎨 Generating plots → {RESULT_DIR}/")
+    print(f"\n Generating plots → {RESULT_DIR}/")
 
     plot_cumulative_wealth(strategies)
     plot_drawdowns(strategies)
@@ -449,7 +399,7 @@ def plot_all(strategies: dict, metrics_df: pd.DataFrame):
         weights_df = pd.read_csv(weights_path, index_col=0, parse_dates=True)
         plot_weight_evolution(weights_df)
 
-    print(f"\n✅ All plots saved to {RESULT_DIR}/")
+    print(f"\n All plots saved to {RESULT_DIR}/")
 
 
 if __name__ == "__main__":
@@ -480,4 +430,4 @@ if __name__ == "__main__":
     metrics_df = compare_strategies(strategies)
 
     plot_all(strategies, metrics_df)
-    print("✅ Visualization test complete!")
+    print(" Visualization test complete!")
