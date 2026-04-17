@@ -1,0 +1,25 @@
+vs_strategy,test,p_value,significant
+PPO-log_return,Jobson-Korkie Sharpe Ratio Test,0.0,True
+PPO-log_return,Block Bootstrap Cumulative Return Test,0.301,False
+PPO-log_return,Permutation Test (Omega Ratio),0.3948,False
+PPO-log_return,Paired t-test (daily returns),0.642502,False
+PPO-dsr,Jobson-Korkie Sharpe Ratio Test,0.0,True
+PPO-dsr,Block Bootstrap Cumulative Return Test,0.2276,False
+PPO-dsr,Permutation Test (Omega Ratio),0.4462,False
+PPO-dsr,Paired t-test (daily returns),0.444481,False
+PPO-mdd,Jobson-Korkie Sharpe Ratio Test,0.0,True
+PPO-mdd,Block Bootstrap Cumulative Return Test,0.2272,False
+PPO-mdd,Permutation Test (Omega Ratio),0.4401,False
+PPO-mdd,Paired t-test (daily returns),0.425407,False
+Market Index,Jobson-Korkie Sharpe Ratio Test,0.0,True
+Market Index,Block Bootstrap Cumulative Return Test,0.0842,False
+Market Index,Permutation Test (Omega Ratio),0.3552,False
+Market Index,Paired t-test (daily returns),0.109235,False
+1/N Strategy,Jobson-Korkie Sharpe Ratio Test,0.0,True
+1/N Strategy,Block Bootstrap Cumulative Return Test,0.2142,False
+1/N Strategy,Permutation Test (Omega Ratio),0.4375,False
+1/N Strategy,Paired t-test (daily returns),0.420016,False
+MVO,Jobson-Korkie Sharpe Ratio Test,0.0,True
+MVO,Block Bootstrap Cumulative Return Test,0.2242,False
+MVO,Permutation Test (Omega Ratio),0.1834,False
+MVO,Paired t-test (daily returns),0.560609,False

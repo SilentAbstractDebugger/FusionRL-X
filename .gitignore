@@ -1,0 +1,25 @@
+# --- Data ---
+# Ignore the raw data and processed features to keep the repo light
+ra_drl/data/raw/
+ra_drl/data/features/
+
+# --- Models ---
+# Ignore trained model weights/checkpoints (usually .pth, .h5, or .pkl)
+ra_drl/models/
+*.pth
+*.pkl
+
+]
+
+# --- Python & Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# --- System Files ---
+.DS_Store
+Thumbs.db
+.lightning_studio/

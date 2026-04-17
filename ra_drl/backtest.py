@@ -145,50 +145,60 @@ def run_fusion_inference(stacked_actions, dates, tickers, n_assets):
 
     # Load model
     checkpoint = torch.load(ckpt_path, map_location="cpu")
+    # Local import to ensure the class is available
     from fusion.transformer_fusion import TransformerFusionModule, FusionInference
+    
     model = TransformerFusionModule(n_assets=n_assets, **FUSION_CONFIG)
     model.load_state_dict(checkpoint["model_state_dict"])
     fusion = FusionInference(model)
 
     # Get weights + diagnostics for every date
-    # FIX: collect per-sample alpha and disagree_norm (not batch averages)
     print(f"  Running inference on {len(dates)} test dates...")
-    weights_list   = []
-    gate_alphas    = []   # now a flat list of per-sample values
-    disagree_norms = []   # now a flat list of per-sample values
+    weights_list    = []
+    gate_alphas     = []
+    disagree_norms  = []
 
     batch_size = 64
     for i in range(0, len(dates), batch_size):
         batch = stacked_actions[i:i+batch_size]
         diag  = fusion.predict_with_diagnostics(batch)
+        
+        # 1. Collect Portfolio Weights
         weights_list.append(diag["final_weights"])
+        
+        # 2. Collect Gate Alphas (ensuring they are flat to avoid shape errors)
+        alpha_val = diag.get("gate_alpha", 1.0)
+        if isinstance(alpha_val, (np.ndarray, torch.Tensor)):
+            gate_alphas.extend(alpha_val.flatten())
+        elif isinstance(alpha_val, list):
+            gate_alphas.extend(alpha_val)
+        else:
+            # If it's a single scalar for the whole batch, repeat it
+            gate_alphas.extend([alpha_val] * len(batch))
 
-        # gate_alpha is now (batch,) from the fixed FusionInference — collect per sample
-        alpha_batch = diag.get("gate_alpha", np.ones(len(batch)))
-        if np.ndim(alpha_batch) == 0:
-            # old scalar fallback — broadcast to batch size
-            alpha_batch = np.full(len(batch), float(alpha_batch))
-        gate_alphas.extend(alpha_batch.tolist())
-
-        # Per-sample disagreement norm (axis=-1 gives one value per sample)
+        # 3. Disagreement magnitude
         if "disagree_emb" in diag:
-            d_norms = np.linalg.norm(diag["disagree_emb"], axis=-1)  # (batch,)
-            disagree_norms.extend(d_norms.tolist())
+            d_norm = np.linalg.norm(diag["disagree_emb"], axis=-1)
+            disagree_norms.extend(d_norm.flatten())
 
-    weights    = np.concatenate(weights_list, axis=0)
+    # Concatenate all batches into one (T, N) matrix
+    weights = np.concatenate(weights_list, axis=0)
     weights_df = pd.DataFrame(weights, index=dates, columns=tickers)
 
-    avg_alpha = float(np.mean(gate_alphas))
-    print(f"  ✅ Fusion complete")
-    print(f"     Gate α — mean={avg_alpha:.4f}, std={np.std(gate_alphas):.4f}  "
-          f"(std > 0.01 means gate is dynamic)")
-    print(f"     Weight sum check (should be ~1): {weights_df.sum(axis=1).mean():.6f}")
+    # Calculate means safely
+    avg_alpha = np.mean(gate_alphas) if gate_alphas else 1.0
+    avg_disagree = np.mean(disagree_norms) if disagree_norms else 0.0
 
-    # Save per-date diagnostics (now varies by day — not a constant column)
+    print(f"  ✅ Fusion complete")
+    print(f"      Learned gate α = {avg_alpha:.4f}  "
+          f"→ {avg_alpha*100:.1f}% Transformer, {(1-avg_alpha)*100:.1f}% agent blend")
+    print(f"      Weight sum check (should be ~1): {weights_df.sum(axis=1).mean():.6f}")
+
+    # Save diagnostics
     diag_df = pd.DataFrame({
-        "date":         dates,
-        "gate_alpha":   gate_alphas if len(gate_alphas) == len(dates) else [avg_alpha] * len(dates),
-        "disagree_norm": disagree_norms if len(disagree_norms) == len(dates) else [0.0] * len(dates),
+        "date":          dates,
+        "gate_alpha":    avg_alpha,
+        "disagree_norm": avg_disagree,
     })
     diag_df.to_csv(os.path.join(RESULT_DIR, "fusion_diagnostics.csv"), index=False)
 
@@ -302,14 +312,16 @@ def run_backtest():
     print("=" * 70)
     print(metrics_df.to_string())
 
-    # ── 10. Statistical significance test (RA-DRL vs best baseline)
-    print("\n🧪 Statistical Significance Tests:")
-    ra_returns = ra_drl_portfolio.pct_change().dropna().values
-
-    for name, portfolio in benchmarks.items():
-        if portfolio is not None and len(portfolio) > 10:
-            b_returns = portfolio.pct_change().dropna().values
-            paired_t_test(ra_returns, b_returns, "RA-DRL", name)
+    # ── 10. Proper statistical significance tests
+    print("\n🧪 Running proper statistical significance tests...")
+    from utils.statistical_tests import run_all_significance_tests
+    sig_results = run_all_significance_tests(
+        strategies    = all_strategies,
+        ra_drl_name   = "RA-DRL",
+        rf            = 0.0525,
+        print_results = True,
+    )
+    sig_results.to_csv(os.path.join(RESULT_DIR, "significance_tests.csv"), index=False)
 
     # ── 11. Save results
     print(f"\n💾 Saving results to {RESULT_DIR}/")
