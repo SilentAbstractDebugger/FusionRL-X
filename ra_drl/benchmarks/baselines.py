@@ -1,30 +1,3 @@
-"""
-benchmarks/baselines.py
-────────────────────────
-All benchmark strategies from the paper Section 4.4.
-
-BENCHMARKS:
-  1. Market Index      — Dow Jones Industrial Average (^DJI)
-  2. 1/N Strategy      — Equal weight across all assets
-  3. Mean-Variance Opt — Markowitz MVO (minimize variance for target return)
-  4. Single-Objective  — Weighted sum of all 3 rewards (one PPO agent)
-
-These are compared against RA-DRL in the results table.
-
-MARKOWITZ MVO MATH:
-  minimize:   w^T Σ w          (portfolio variance)
-  subject to: μ^T w = μ_target (target expected return)
-              Σ w_i = 1
-              0 ≤ w_i ≤ 1      (no short-selling)
-
-  Σ = covariance matrix of returns
-  μ = vector of expected returns
-
-  We solve this using CVXPY (convex optimization).
-  In practice, MVO is rebalanced periodically (e.g., monthly) using
-  in-sample data for Σ and μ estimation.
-"""
-
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,26 +18,12 @@ from config import (
 from utils.metrics import compute_all_metrics
 
 
-# ─────────────────────────────────────────────────────────
-# UTILITY: Portfolio simulation from weights
-# ─────────────────────────────────────────────────────────
-
 def simulate_portfolio(
     close_df:         pd.DataFrame,
     weights_df:       pd.DataFrame,        # (T × N) rebalancing weights
     initial_capital:  float = INITIAL_CAPITAL,
     transaction_cost: float = TRANSACTION_COST,
 ) -> pd.Series:
-    """
-    Simulate portfolio value given weight decisions.
-
-    Args:
-        close_df:    (T × N) daily closing prices (test period)
-        weights_df:  (T × N) portfolio weights (one row per date)
-                     Dates must be a subset of close_df dates.
-    Returns:
-        portfolio_values: pd.Series indexed by date
-    """
     dates = close_df.index
     portfolio_value = initial_capital
     current_weights = np.zeros(close_df.shape[1])
@@ -106,9 +65,7 @@ def simulate_portfolio(
     return pd.Series(values, index=dates, name="portfolio_value")
 
 
-# ─────────────────────────────────────────────────────────
 # BENCHMARK 1: MARKET INDEX
-# ─────────────────────────────────────────────────────────
 
 def market_index_benchmark(
     start: str = TEST_START,
@@ -116,11 +73,8 @@ def market_index_benchmark(
     ticker: str = MARKET_INDEX,
     initial_capital: float = INITIAL_CAPITAL,
 ) -> pd.Series:
-    """
-    Download Dow Jones Industrial Average (^DJI) returns.
-    Simulate an investor who just holds the index.
-    """
-    print(f"\n📈 Fetching Market Index ({ticker})...")
+   
+    print(f"\n Fetching Market Index ({ticker})...")
     index_df = yf.download(ticker, start=start, end=end,
                            progress=False, auto_adjust=True)
     close = index_df["Close"].squeeze()
@@ -129,26 +83,18 @@ def market_index_benchmark(
     # Normalize to initial capital
     portfolio = initial_capital * (close / close.iloc[0])
     portfolio.name = "Market Index"
-    print(f"  ✅ Market Index: {close.index[0].date()} → {close.index[-1].date()}")
+    print(f"  Market Index: {close.index[0].date()} → {close.index[-1].date()}")
     return portfolio
 
-
-# ─────────────────────────────────────────────────────────
 # BENCHMARK 2: 1/N EQUAL WEIGHT STRATEGY
-# ─────────────────────────────────────────────────────────
 
 def equal_weight_benchmark(
     close_df: pd.DataFrame,
     initial_capital: float = INITIAL_CAPITAL,
     transaction_cost: float = TRANSACTION_COST,
 ) -> pd.Series:
-    """
-    Equal weight: 1/N allocation across all N assets.
-    Never rebalanced (buy-and-hold equal weight on day 1).
-
-    Simple but surprisingly hard to beat (DeMiguel et al., 2007).
-    """
-    print("\n⚖️  Computing 1/N Equal Weight strategy...")
+    
+    print("\n Computing 1/N Equal Weight strategy...")
     N = close_df.shape[1]
     weights = np.ones(N) / N
 
@@ -161,13 +107,10 @@ def equal_weight_benchmark(
 
     portfolio = simulate_portfolio(close_df, weights_df, initial_capital, transaction_cost)
     portfolio.name = "1/N Strategy"
-    print(f"  ✅ Equal weight: {portfolio.iloc[-1]:,.0f} (final value)")
+    print(f"  Equal weight: {portfolio.iloc[-1]:,.0f} (final value)")
     return portfolio
 
-
-# ─────────────────────────────────────────────────────────
 # BENCHMARK 3: MEAN-VARIANCE OPTIMIZATION (MVO)
-# ─────────────────────────────────────────────────────────
 
 def solve_mvo(
     mu:     np.ndarray,   # (N,) expected returns
@@ -175,21 +118,7 @@ def solve_mvo(
     target_return: Optional[float] = None,
     risk_free_rate: float = RISK_FREE_RATE / 252,   # daily
 ) -> np.ndarray:
-    """
-    Solve Markowitz MVO:
-      minimize   w^T Σ w
-      subject to 1^T w = 1
-                 0 ≤ w ≤ 1
-                 μ^T w ≥ target_return   (optional)
 
-    Args:
-        mu:            Expected daily returns vector (N,)
-        Sigma:         Covariance matrix (N, N)
-        target_return: If None, maximizes Sharpe (tangency portfolio)
-
-    Returns:
-        w: (N,) optimal portfolio weights
-    """
     N = len(mu)
     w = cp.Variable(N)
 
@@ -238,17 +167,8 @@ def mvo_benchmark(
     initial_capital:  float = INITIAL_CAPITAL,
     transaction_cost: float = TRANSACTION_COST,
 ) -> pd.Series:
-    """
-    Rolling MVO benchmark.
-
-    Every `rebalance_freq` days:
-      1. Estimate μ and Σ from last `lookback` days of training data
-      2. Solve MVO to get optimal weights
-      3. Apply those weights until next rebalance
-
-    Uses ONLY past data (no lookahead).
-    """
-    print("\n🎯 Computing MVO strategy...")
+   
+    print("\n Computing MVO strategy...")
 
     # Combine train + test close prices for rolling estimation
     train_close = close_df[close_df.index <= TRAIN_END]
@@ -281,27 +201,13 @@ def mvo_benchmark(
 
     portfolio = simulate_portfolio(test_close, weights_df, initial_capital, transaction_cost)
     portfolio.name = "MVO"
-    print(f"  ✅ MVO final value: ${portfolio.iloc[-1]:,.0f}")
+    print(f"  MVO final value: ${portfolio.iloc[-1]:,.0f}")
     return portfolio
 
 
-# ─────────────────────────────────────────────────────────
 # BENCHMARK 4: SINGLE-OBJECTIVE (Weighted Sum of Rewards)
-# ─────────────────────────────────────────────────────────
 
 class SingleObjectiveAgent:
-    """
-    Single-objective agent using WEIGHTED SUM of all 3 rewards.
-
-    Instead of training 3 separate agents and fusing, this trains ONE agent
-    with a combined reward: λ₁·LR + λ₂·DSR + λ₃·MDD
-
-    The weights (λ₁, λ₂, λ₃) are treated as hyperparameters and optimized.
-    This is the paper's "single objective" benchmark.
-
-    Training is done in train_agents.py using a special combined reward env.
-    Here we just load its saved actions.
-    """
 
     def __init__(self, lambda_lr: float = 0.33, lambda_dsr: float = 0.33, lambda_mdd: float = 0.34):
         self.lambdas = {"log_return": lambda_lr, "dsr": lambda_dsr, "mdd": lambda_mdd}
@@ -313,29 +219,18 @@ class SingleObjectiveAgent:
                 self.lambdas["mdd"]        * mdd_reward)
 
 
-# ─────────────────────────────────────────────────────────
-# RUN ALL BENCHMARKS
-# ─────────────────────────────────────────────────────────
 
 def run_all_benchmarks(
     close_df: pd.DataFrame,   # test period close prices
 ) -> dict:
-    """
-    Run all benchmark strategies and return portfolio value series.
-
-    Args:
-        close_df: (T × N) test period closing prices
-
-    Returns:
-        dict: {strategy_name: portfolio_value_series}
-    """
+  
     results = {}
 
     # 1. Market Index
     try:
         results["Market Index"] = market_index_benchmark()
     except Exception as e:
-        print(f"  ⚠️  Market Index failed: {e}")
+        print(f"   Market Index failed: {e}")
 
     # 2. Equal Weight
     results["1/N Strategy"] = equal_weight_benchmark(close_df)
@@ -351,17 +246,7 @@ def compare_with_benchmarks(
     agent_values:  dict,   # {reward_type: portfolio_series} for 3 base agents
     close_df:      pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Full comparison table: RA-DRL vs 3 base agents vs 4 benchmarks.
-
-    Args:
-        ra_drl_values: portfolio series for the fused RA-DRL model
-        agent_values:  dict of base agent portfolio series
-        close_df:      test period close prices
-
-    Returns:
-        metrics DataFrame
-    """
+    
     from utils.metrics import compute_all_metrics
 
     all_strategies = {}
@@ -387,10 +272,7 @@ def compare_with_benchmarks(
     df = pd.DataFrame(rows).set_index("Strategy")
     return df
 
-
-# ─────────────────────────────────────────────────────────
 # QUICK TEST
-# ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     from data.feature_engineering import load_features
