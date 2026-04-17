@@ -1,41 +1,3 @@
-"""
-agents/evaluate_agents.py
-──────────────────────────
-STEP 3.5 — Individual Agent Evaluation (BEFORE fusion)
-
-This is the missing evaluation step between:
-  Step 3: Train 3 PPO agents
-  Step 4: Supervised pre-training of fusion
-
-WHY THIS STEP EXISTS (from paper Section 4.5):
-  "Firstly, the RA-DRL is assessed against the base model with different
-   objectives used by recent studies, and subsequently, it is evaluated
-   against the benchmarks."
-
-  The paper first validates that each individual agent has learned something
-  meaningful before trusting them to contribute to the fusion. If an agent
-  performs WORSE than random or the market index, its actions will corrupt
-  the fusion module's output.
-
-WHAT THIS SCRIPT DOES:
-  1. Loads all 3 trained PPO agents
-  2. Runs each agent on TEST data (2021–2024) independently
-  3. Simulates portfolio with 0.05% transaction cost for each
-  4. Fetches Dow Jones Index (^DJI) as baseline
-  5. Computes all 8 metrics for each agent + index
-  6. Prints a comparison table
-  7. Plots cumulative wealth curves for all 3 agents vs index
-  8. Runs sanity checks — flags any agent that underperforms 1/N
-  9. Saves everything to results/pre_fusion_evaluation/
-
-PASS CRITERIA before proceeding to fusion:
-  - Each agent's Sharpe Ratio > 0 (positive risk-adjusted return)
-  - Each agent's Cumulative Return > Market Index (at least 2 of 3)
-  - No agent has MDD > 50% (catastrophic loss = untrained agent)
-
-RUN: python agents/evaluate_agents.py
-"""
-
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,21 +24,20 @@ EVAL_DIR = os.path.join(RESULT_DIR, "pre_fusion_evaluation")
 os.makedirs(EVAL_DIR, exist_ok=True)
 
 
-# ─────────────────────────────────────────────────────────
-# LOAD AGENTS
-# ─────────────────────────────────────────────────────────
+
+# LOAD AGENTs
 
 def load_trained_agents(state_df, close_df):
     """Load all 3 PPO agents from saved checkpoints."""
     agents = {}
     reward_types = ["log_return", "dsr", "mdd"]
 
-    print("📂 Loading trained PPO agents...")
+    print(" Loading trained PPO agents...")
     for rt in reward_types:
         model_path = os.path.join(MODEL_DIR, f"ppo_{rt}.zip")
         if not os.path.exists(model_path):
-            print(f"  ❌ Missing: {model_path}")
-            print(f"     Run: python agents/train_agents.py first")
+            print(f" Missing: {model_path}")
+            print(f"  Run: python agents/train_agents.py first")
             sys.exit(1)
 
         env = PortfolioEnv(
@@ -88,14 +49,12 @@ def load_trained_agents(state_df, close_df):
         agent = PPOPortfolioAgent(rt, env)
         agent.load()
         agents[rt] = (agent, env)
-        print(f"  ✅ Loaded: ppo_{rt}")
+        print(f" Successfully Loaded: ppo_{rt}")
 
     return agents
 
 
-# ─────────────────────────────────────────────────────────
-# RUN EACH AGENT ON TEST SET
-# ─────────────────────────────────────────────────────────
+# Run each agent on test set
 
 def run_agent_on_test(
     agent: PPOPortfolioAgent,
@@ -119,6 +78,7 @@ def run_agent_on_test(
 
     while not done:
         date    = env.dates[min(step, len(env.dates) - 1)]
+      
         # Deterministic=True → greedy policy (no exploration noise)
         weights = agent.get_action(obs, deterministic=True)
         weights_dict[date] = weights
@@ -127,11 +87,11 @@ def run_agent_on_test(
         dates_list.append(date)
         step += 1
 
-    # Build weight DataFrame
+    # Building weight DataFrame
     weight_df = pd.DataFrame(weights_dict).T
     weight_df.columns = tickers
 
-    # Simulate portfolio with transaction costs
+    # Simulating portfolio with transaction costs
     test_close = close_df[close_df.index >= TEST_START]
     portfolio  = simulate_portfolio(
         close_df         = test_close,
@@ -144,25 +104,20 @@ def run_agent_on_test(
     return portfolio, weight_df
 
 
-# ─────────────────────────────────────────────────────────
 # FETCH MARKET INDEX
-# ─────────────────────────────────────────────────────────
 
 def fetch_market_index(start=TEST_START, end=TEST_END) -> pd.Series:
     """Download Dow Jones index and normalize to initial capital."""
-    print(f"\n📈 Fetching Market Index ({MARKET_INDEX})...")
+    print(f"\n Fetching Market Index ({MARKET_INDEX})...")
     df = yf.download(MARKET_INDEX, start=start, end=end, progress=False, auto_adjust=True)
     close = df["Close"].squeeze().sort_index()
     portfolio = INITIAL_CAPITAL * (close / close.iloc[0])
     portfolio.name = "Market Index (^DJI)"
-    print(f"  ✅ {close.index[0].date()} → {close.index[-1].date()}")
+    print(f"  {close.index[0].date()} → {close.index[-1].date()}")
     return portfolio
 
 
-# ─────────────────────────────────────────────────────────
-# SANITY CHECKS
-# ─────────────────────────────────────────────────────────
-
+# Sanity Checks
 def run_sanity_checks(
     agent_portfolios: dict,
     index_portfolio:  pd.Series,
@@ -183,14 +138,14 @@ def run_sanity_checks(
     """
     results = {}
 
-    print("\n🔍 Running pre-fusion sanity checks...")
+    print("\n Running pre-fusion sanity checks...")
     print("─" * 55)
 
     for name, portfolio in agent_portfolios.items():
         daily_returns = portfolio.pct_change().dropna().values
         issues = []
 
-        # Compute key metrics
+        # Computing key metrics
         from utils.metrics import (
             sharpe_ratio, maximum_drawdown, cumulative_return, annual_return
         )
@@ -220,7 +175,7 @@ def run_sanity_checks(
         passed = len(issues) == 0
         results[name] = {"passed": passed, "issues": issues, "sr": sr, "mdd": mdd, "cr": cr}
 
-        status = "✅ PASS" if passed else "⚠️  WARN"
+        status = " PASS" if passed else " WARN"
         print(f"  {status}  {name:<20} SR={sr:+.3f}  MDD={mdd:.1%}  CR={cr:+.2%}")
         for issue in issues:
             print(f"           └─ {issue}")
@@ -229,17 +184,15 @@ def run_sanity_checks(
 
     all_passed = all(v["passed"] for v in results.values())
     if all_passed:
-        print("  ✅ All agents passed — safe to proceed to fusion\n")
+        print("  All agents passed — safe to proceed to fusion\n")
     else:
-        print("  ⚠️  Some agents have warnings — review before fusion")
+        print("   Some agents have warnings, review before fusion")
         print("     Consider: more training timesteps, different HP, check data\n")
 
     return results
 
 
-# ─────────────────────────────────────────────────────────
-# PLOTS
-# ─────────────────────────────────────────────────────────
+# Plots
 
 def plot_agent_comparison(
     agent_portfolios: dict,
@@ -276,7 +229,7 @@ def plot_agent_comparison(
                          "axes.grid": True, "grid.alpha": 0.25,
                          "axes.spines.top": False, "axes.spines.right": False})
 
-    # ── PLOT A: Cumulative wealth
+    # PLOT A: Cumulative wealth
     fig, ax = plt.subplots(figsize=(13, 5))
     for name, port in all_portfolios.items():
         if port is None: continue
@@ -298,9 +251,9 @@ def plot_agent_comparison(
     path = os.path.join(EVAL_DIR, "A_cumulative_wealth.png")
     plt.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
-    print(f"  💾 Saved: {path}")
+    print(f" Saved: {path}")
 
-    # ── PLOT B: Rolling 63-day Sharpe
+    # PLOT B: Rolling 63-day Sharpe
     fig, ax = plt.subplots(figsize=(13, 4))
     daily_rf = RISK_FREE_RATE / 252
     for name, port in agent_portfolios.items():
@@ -323,9 +276,9 @@ def plot_agent_comparison(
     path = os.path.join(EVAL_DIR, "B_rolling_sharpe.png")
     plt.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
-    print(f"  💾 Saved: {path}")
+    print(f" Saved: {path}")
 
-    # ── PLOT C: Drawdown comparison
+    # PLOT C: Drawdown comparison
     fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
     AGENT_COLORS = ["#638cff", "#2dd4b4", "#f5a623"]
     for i, (name, port) in enumerate(agent_portfolios.items()):
@@ -336,6 +289,7 @@ def plot_agent_comparison(
                         alpha=0.3, color=AGENT_COLORS[i])
         ax.plot(drawdown.index, drawdown.values,
                 color=AGENT_COLORS[i], linewidth=1.5)
+      
         # Overlay index drawdown
         idx_aligned = index_portfolio.reindex(drawdown.index, method="ffill")
         if idx_aligned is not None:
@@ -355,7 +309,7 @@ def plot_agent_comparison(
     path = os.path.join(EVAL_DIR, "C_drawdowns.png")
     plt.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
-    print(f"  💾 Saved: {path}")
+    print(f" Saved: {path}")
 
 
 def plot_weight_heatmaps(weight_histories: dict, tickers: list):
@@ -369,11 +323,12 @@ def plot_weight_heatmaps(weight_histories: dict, tickers: list):
 
     for i, (rt, wdf) in enumerate(weight_histories.items()):
         ax = axes[i]
-        # Sort assets by mean allocation (most allocated at top)
+      
+        # Sort assets by mean allocation
         mean_weights = wdf.mean().sort_values(ascending=True)
         sorted_df    = wdf[mean_weights.index]
 
-        # Plot rolling 30-day average weight as heatmap
+        # Plot rolling 30 day average weight as heatmap
         import matplotlib.colors as mcolors
         smooth = sorted_df.rolling(30, min_periods=1).mean()
 
@@ -399,15 +354,13 @@ def plot_weight_heatmaps(weight_histories: dict, tickers: list):
     path = os.path.join(EVAL_DIR, "D_weight_heatmaps.png")
     plt.savefig(path, dpi=180, bbox_inches="tight")
     plt.close()
-    print(f"  💾 Saved: {path}")
+    print(f" Saved: {path}")
 
 
-# ─────────────────────────────────────────────────────────
-# PRINT RESULTS TABLE
-# ─────────────────────────────────────────────────────────
+# Printing Results Table
 
 def print_results_table(metrics_df: pd.DataFrame):
-    """Pretty-print the evaluation table."""
+    """print the evaluation table."""
     BOLD    = "\033[1m"
     RESET   = "\033[0m"
     GREEN   = "\033[92m"
@@ -441,13 +394,11 @@ def print_results_table(metrics_df: pd.DataFrame):
     print(f"{'═'*90}\n")
 
 
-# ─────────────────────────────────────────────────────────
-# STATISTICAL TESTS (agent vs index)
-# ─────────────────────────────────────────────────────────
+# Statistical Tests (agent vs index)
 
 def run_statistical_tests(agent_portfolios: dict, index_portfolio: pd.Series):
     """Paired t-test: is each agent significantly better than the market index?"""
-    print("🧪 Statistical Tests (each agent vs ^DJI):")
+    print(" Statistical Tests (each agent vs ^DJI):")
     print("─" * 55)
 
     index_returns = index_portfolio.pct_change().dropna().values
@@ -462,9 +413,7 @@ def run_statistical_tests(agent_portfolios: dict, index_portfolio: pd.Series):
         )
 
 
-# ─────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────
+# Main
 
 def evaluate_all_agents():
     """Full pre-fusion evaluation pipeline."""
@@ -473,16 +422,16 @@ def evaluate_all_agents():
     print("  STEP 3.5 — PRE-FUSION AGENT EVALUATION")
     print("═"*60)
 
-    # ── 1. Load features
-    print("\n📂 Loading features...")
+    # Load features
+    print("\n Loading features...")
     state_df, close_df, cov_array, tickers = load_features()
     test_close = close_df[close_df.index >= TEST_START]
 
-    # ── 2. Load trained agents
+    # Load trained agents
     agents = load_trained_agents(state_df, close_df)
 
-    # ── 3. Run each agent on test set
-    print("\n🚀 Running agents on test period...")
+    # Run each agent on test set
+    print("\n Running agents on test period...")
     agent_portfolios = {}
     weight_histories = {}
 
@@ -494,12 +443,12 @@ def evaluate_all_agents():
         print(f"    Final value: ${portfolio.iloc[-1]:,.0f}  "
               f"({(portfolio.iloc[-1]/INITIAL_CAPITAL - 1)*100:+.1f}%)")
 
-    # ── 4. Fetch benchmarks for comparison
+    # Fetching benchmarks for comparison
     index_portfolio = fetch_market_index()
     equal_portfolio = equal_weight_benchmark(test_close)
 
-    # ── 5. Compute metrics for all
-    print("\n📊 Computing performance metrics...")
+    # Compute metrics for all
+    print("\n Computing performance metrics...")
     all_strategies = {
         **agent_portfolios,
         "Market Index (^DJI)": index_portfolio,
@@ -507,22 +456,22 @@ def evaluate_all_agents():
     }
     metrics_df = compare_strategies(all_strategies)
 
-    # ── 6. Print results table
+    # Print results table
     print_results_table(metrics_df)
 
-    # ── 7. Sanity checks
+    # Sanity checks
     check_results = run_sanity_checks(agent_portfolios, index_portfolio, equal_portfolio)
 
-    # ── 8. Statistical significance tests
+    # Statistical significance tests
     run_statistical_tests(agent_portfolios, index_portfolio)
 
-    # ── 9. Generate plots
-    print("\n🎨 Generating evaluation plots...")
+    # Generate plots
+    print("\n Generating evaluation plots...")
     plot_agent_comparison(agent_portfolios, index_portfolio, equal_portfolio)
     plot_weight_heatmaps(weight_histories, tickers)
 
-    # ── 10. Save results
-    print("\n💾 Saving evaluation results...")
+    # Saving results
+    print("\n Saving evaluation results...")
     metrics_df.to_csv(os.path.join(EVAL_DIR, "pre_fusion_metrics.csv"))
 
     # Save weight histories
@@ -549,7 +498,7 @@ def evaluate_all_agents():
     with open(os.path.join(EVAL_DIR, "sanity_check_report.txt"), "w") as f:
         f.write("\n".join(report_lines))
 
-    print(f"\n✅ All evaluation outputs saved to: {EVAL_DIR}/")
+    print(f"\n All evaluation outputs saved to: {EVAL_DIR}/")
     print("\n   Files generated:")
     print("     A_cumulative_wealth.png   — wealth curves for all 3 agents")
     print("     B_rolling_sharpe.png      — rolling 63-day Sharpe per agent")
@@ -562,10 +511,10 @@ def evaluate_all_agents():
     print("\n" + "═"*60)
     all_passed = all(v["passed"] for v in check_results.values())
     if all_passed:
-        print("  ✅ PROCEED to Step 4: Supervised Pre-training")
+        print("   PROCEED to Step 4: Supervised Pre-training")
         print("     python fusion/supervised_pretraining.py")
     else:
-        print("  ⚠️  REVIEW failing agents before proceeding to fusion")
+        print("    REVIEW failing agents before proceeding to fusion")
         print("     Consider retraining with more timesteps or different HPs")
     print("═"*60 + "\n")
 
