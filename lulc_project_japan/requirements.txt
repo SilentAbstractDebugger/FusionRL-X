@@ -1,0 +1,40 @@
+# Core scientific computing
+numpy
+pandas
+scipy
+
+# GIS and Remote Sensing
+rasterio
+geopandas
+shapely
+fiona
+pyproj
+rioxarray
+
+# Visualization
+matplotlib
+seaborn
+plotly
+
+# Machine Learning / Deep Learning
+scikit-learn
+tensorflow
+keras
+
+# Landsat data access
+landsatxplore
+
+# Image processing
+opencv-python
+Pillow
+
+# Web app (interface)
+streamlit
+
+# Utilities
+tqdm
+requests
+joblib
+
+# Geospatial analysis
+earthpy
